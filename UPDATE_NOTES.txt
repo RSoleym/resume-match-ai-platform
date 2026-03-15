@@ -1,0 +1,20 @@
+Website updates included in this package:
+- Country filter bug fix kept
+- Results pipeline now saves ALL ranked jobs per resume (not just top 30)
+- Added SQLite output: resume_job_matches.db
+- Added work mode filter: Remote / Hybrid / On-site
+- Default work mode falls back to On-site when unspecified
+- Added max 3 resume upload limit
+- Removed the 500-result ceiling on the Results page page selector
+- Removed the 200-result ceiling on filtered Jobs page results
+
+Important:
+Because the previous resume_job_matches.json may still contain older top-30-only data, run the pipeline again on your machine after replacing the project files so the new ALL-rankings output is generated.
+
+
+2026-03-13 faster matching patch:
+- added lexical prefilter so semantic model only refines top candidate jobs per resume on first run
+- kept full output format by using lexical scores for non-candidate jobs
+- added chunked threaded semantic scoring for larger candidate sets
+- kept per-resume cache and job-embedding cache
+- compacted JSON writes for faster tail-end save time

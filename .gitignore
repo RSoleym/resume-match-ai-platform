@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.db
+*.log
+web_ui/runtime/*
+!web_ui/runtime/.gitkeep
+resumes/*
+!resumes/.gitkeep
+Resume archive/*
+!Resume archive/.gitkeep
+match_cache/*
+!match_cache/.gitkeep
+match_cache_archive/*
+!match_cache_archive/.gitkeep

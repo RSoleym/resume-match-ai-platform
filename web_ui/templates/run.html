@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% set active = "run" %}
+{% block content %}
+  <div class="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+    <div>
+      <h1 class="text-2xl font-semibold">Run Pipeline</h1>
+      <p class="mt-1 text-sm text-slate-400">Start scans your uploaded resume(s), runs Resume OCR, then Job Matcher automatically.</p>
+    </div>
+    <a href="{{ url_for('results_page') }}" class="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold hover:bg-white/15 ring-soft">Go to Results →</a>
+  </div>
+
+  <div class="mt-6 grid gap-4 lg:grid-cols-2">
+    <div class="rounded-3xl bg-white/5 p-5 ring-soft">
+      <div class="text-sm font-semibold">What happens when you start</div>
+
+      <div class="mt-4 space-y-3">
+        <div class="rounded-2xl bg-black/20 px-4 py-3 ring-soft">
+          <div class="text-sm font-semibold text-slate-200">1) Resume OCR</div>
+          <div class="text-xs text-slate-400">Scans all uploaded resumes and updates scanned_resumes.json</div>
+        </div>
+
+        <div class="rounded-2xl bg-black/20 px-4 py-3 ring-soft">
+          <div class="text-sm font-semibold text-slate-200">2) Job Matcher</div>
+          <div class="text-xs text-slate-400">Matches each scanned resume to jobs and updates resume_job_matches.json</div>
+        </div>
+
+        <div class="rounded-2xl bg-black/20 px-4 py-3 ring-soft">
+          <div class="text-sm font-semibold text-slate-200">Multiple resumes supported</div>
+          <div class="text-xs text-slate-400">Results are saved, and you can switch between different resumes on the Results page.</div>
+        </div>
+
+        <form class="pt-1" action="{{ url_for('run_pipeline') }}" method="post">
+          <input type="hidden" name="do_resume_scraper" value="on">
+          <input type="hidden" name="do_job_matcher" value="on">
+          <button class="w-full rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold hover:bg-indigo-500" type="submit">
+            Start
+          </button>
+        </form>
+      </div>
+
+      <div class="mt-4 text-xs text-slate-400">
+        Job scraping is disabled from the website. The progress bar will keep moving while your resumes are processed.
+      </div>
+    </div>
+
+    <div class="rounded-3xl bg-white/5 p-5 ring-soft">
+      <div class="text-sm font-semibold">Progress</div>
+
+      <div class="mt-4 rounded-2xl bg-black/20 p-4 ring-soft">
+        <div class="flex items-center justify-between text-sm">
+          <div>
+            <div class="text-slate-200 font-semibold" id="statusMessage">Idle</div>
+            <div class="text-slate-400 text-xs mt-1">
+              Step: <span class="text-slate-200" id="statusStep">—</span> •
+              Elapsed: <span class="text-slate-200" id="statusElapsed">0s</span>
+            </div>
+          </div>
+          <div class="text-slate-200 font-semibold" id="statusPct">0%</div>
+        </div>
+
+        <div class="mt-3 h-2 w-full rounded-full bg-black/30 ring-soft overflow-hidden">
+          <div id="statusBar" class="h-2 rounded-full bg-gradient-to-r from-indigo-500 to-fuchsia-500 transition-all duration-700 ease-out" style="width: 0%"></div>
+        </div>
+
+        <div class="mt-3 text-xs text-slate-400" id="statusHint"></div>
+      </div>
+
+      <div class="mt-4 hidden rounded-2xl bg-rose-500/10 p-4 text-sm text-rose-200 ring-soft" id="statusErrorBox">
+        <div class="font-semibold">Run failed</div>
+        <div class="mt-1 whitespace-pre-wrap break-words text-xs" id="statusErrorText"></div>
+      </div>
+    </div>
+  </div>
+{% endblock %}

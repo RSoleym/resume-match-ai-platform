@@ -1,0 +1,11 @@
+flask>=3.0.0
+werkzeug>=3.0.0
+pillow>=10.0.0
+pycountry>=23.12.11
+
+# Script/runtime deps used by resume_scraper.py and job_matcher.py
+pytesseract>=0.3.10
+pdf2image>=1.17.0
+sentence-transformers>=2.7.0
+requests>=2.31.0
+beautifulsoup4>=4.12.0

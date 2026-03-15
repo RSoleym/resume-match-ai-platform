@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>{{ title if title else "Job Finder" }}</title>
+
+  <!-- Tailwind via CDN (local UI) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    /* tiny polish */
+    .glass { backdrop-filter: blur(10px); background: rgba(15, 23, 42, 0.55); }
+    .ring-soft { box-shadow: 0 0 0 1px rgba(148,163,184,0.25) inset; }
+  </style>
+</head>
+
+<body class="min-h-screen bg-slate-950 text-slate-100">
+  <div class="absolute inset-0 -z-10 overflow-hidden">
+    <div class="absolute -top-40 -left-40 h-96 w-96 rounded-full bg-indigo-600/30 blur-3xl"></div>
+    <div class="absolute top-20 right-[-120px] h-[520px] w-[520px] rounded-full bg-fuchsia-600/20 blur-3xl"></div>
+    <div class="absolute bottom-[-140px] left-[20%] h-[520px] w-[520px] rounded-full bg-cyan-500/10 blur-3xl"></div>
+  </div>
+
+  <div class="mx-auto max-w-7xl px-4 py-6">
+    <!-- Top bar -->
+    <div class="flex items-center justify-between gap-4">
+      <div class="flex items-center gap-3">
+        <div class="h-10 w-10 rounded-2xl bg-gradient-to-br from-indigo-500 to-fuchsia-500 ring-soft"></div>
+        <div>
+          <div class="text-lg font-semibold leading-tight">Job Finder</div>
+          <div class="text-xs text-slate-400">Localhost dashboard (no login yet)</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- Flash messages -->
+    {% with messages = get_flashed_messages() %}
+      {% if messages %}
+        <div class="mt-4 space-y-2">
+          {% for m in messages %}
+            <div class="glass ring-soft rounded-2xl px-4 py-3 text-sm text-slate-200">
+              {{ m }}
+            </div>
+          {% endfor %}
+        </div>
+      {% endif %}
+    {% endwith %}
+
+    <div class="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-[260px_1fr]">
+      <!-- Sidebar -->
+      <aside class="glass ring-soft rounded-3xl p-4">
+        <nav class="space-y-1">
+          <a href="{{ url_for('dashboard') }}"
+             class="flex items-center justify-between rounded-2xl px-3 py-2 text-sm hover:bg-white/5 {% if active=='dashboard' %}bg-white/5{% endif %}">
+            <span>Dashboard</span><span class="text-slate-400">⌂</span>
+          </a>
+          <a href="{{ url_for('upload_page') }}"
+             class="flex items-center justify-between rounded-2xl px-3 py-2 text-sm hover:bg-white/5 {% if active=='upload' %}bg-white/5{% endif %}">
+            <span>Upload</span><span class="text-slate-400">⇪</span>
+          </a>
+          <a href="{{ url_for('run_page') }}"
+             class="flex items-center justify-between rounded-2xl px-3 py-2 text-sm hover:bg-white/5 {% if active=='run' %}bg-white/5{% endif %}">
+            <span>Run Pipeline</span><span class="text-slate-400">⚙</span>
+          </a>
+          <a href="{{ url_for('results_page') }}"
+             class="flex items-center justify-between rounded-2xl px-3 py-2 text-sm hover:bg-white/5 {% if active=='results' %}bg-white/5{% endif %}">
+            <span>Results</span><span class="text-slate-400">★</span>
+          </a>
+          <a href="{{ url_for('jobs_page') }}"
+             class="flex items-center justify-between rounded-2xl px-3 py-2 text-sm hover:bg-white/5 {% if active=='jobs' %}bg-white/5{% endif %}">
+            <span>Jobs</span><span class="text-slate-400">☰</span>
+          </a>
+        </nav>
+
+        <div class="mt-4 rounded-2xl bg-white/5 p-3 text-xs text-slate-300">
+          <div class="font-semibold text-slate-200">Tip</div>
+          <div class="mt-1 text-slate-400">
+            Upload PDFs (or images → auto-convert to PDF), run <b>Resume OCR</b>, then <b>Job Matcher</b>.
+          </div>
+        </div>
+      </aside>
+
+      <!-- Main -->
+      <main class="glass ring-soft rounded-3xl p-6">
+        {% block content %}{% endblock %}
+      </main>
+    </div>
+
+    <div class="mt-6 text-center text-xs text-slate-500">
+      Built for your existing scripts (no fundamental code changes).
+    </div>
+  </div>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
