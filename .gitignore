@@ -14,3 +14,8 @@ match_cache/*
 !match_cache/.gitkeep
 match_cache_archive/*
 !match_cache_archive/.gitkeep
+scraped_jobs.json
+resume_job_matches.json
+resumes_manifest.json
+scanned_resumes.json
+job_embeddings_cache.json
