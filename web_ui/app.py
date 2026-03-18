@@ -15,9 +15,11 @@ import shutil
 import sqlite3
 
 import pycountry
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify
+from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session
 from werkzeug.utils import secure_filename
 from PIL import Image
+
+from web_ui.supabase_db import get_supabase_db
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR.parent
@@ -48,6 +50,10 @@ LAST_STDERR = RUNTIME_DIR / "last_stderr.txt"
 
 ALLOWED_RESUME_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+
+SUPABASE_DB = get_supabase_db()
+_SUPABASE_JOBS_CACHE: Optional[Tuple[float, List[Dict[str, Any]], Dict[str, Dict[str, Any]]]] = None
+SUPABASE_JOBS_CACHE_TTL_S = int(os.environ.get("SUPABASE_JOBS_CACHE_TTL_S", "60"))
 
 app = Flask(__name__)
 
@@ -122,6 +128,52 @@ def make_timestamped_pdf_name(original_name: str) -> str:
     return candidate
 
 
+
+
+def get_current_user_id() -> Optional[str]:
+    user_id = session.get("user_id")
+    if isinstance(user_id, str) and user_id.strip():
+        return user_id.strip()
+    header_user_id = request.headers.get("X-User-Id", "").strip()
+    if header_user_id:
+        return header_user_id
+    return None
+
+
+def get_user_active_resume_count(user_id: Optional[str]) -> int:
+    if not user_id:
+        return len(list(RESUMES_DIR.glob("*.pdf"))) if RESUMES_DIR.exists() else 0
+    if SUPABASE_DB is None:
+        return len(list(RESUMES_DIR.glob("*.pdf"))) if RESUMES_DIR.exists() else 0
+    try:
+        return SUPABASE_DB.count(
+            "resumes",
+            filters={
+                "user_id": f"eq.{user_id}",
+                "archived": "eq.false",
+            },
+        )
+    except Exception as e:
+        _rt_append(LAST_STDERR, f"Supabase per-user resume count failed: {repr(e)}")
+        return len(list(RESUMES_DIR.glob("*.pdf"))) if RESUMES_DIR.exists() else 0
+
+
+def get_user_resume_rows(user_id: Optional[str]) -> List[Dict[str, Any]]:
+    if not user_id or SUPABASE_DB is None:
+        return []
+    try:
+        return SUPABASE_DB.select(
+            "resumes",
+            filters={
+                "user_id": f"eq.{user_id}",
+                "archived": "eq.false",
+            },
+            order="uploaded_at.desc",
+        )
+    except Exception as e:
+        _rt_append(LAST_STDERR, f"Supabase per-user resume fetch failed: {repr(e)}")
+        return []
+
 def humanize_age(uploaded_at: str) -> str:
     try:
         dt = datetime.fromisoformat(uploaded_at)
@@ -147,6 +199,30 @@ def humanize_age(uploaded_at: str) -> str:
 
 
 def get_active_resume_items() -> List[Dict[str, Any]]:
+    user_id = get_current_user_id()
+    if user_id and SUPABASE_DB is not None:
+        rows = get_user_resume_rows(user_id)
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            stored_filename = str(row.get("stored_filename") or "").strip()
+            if not stored_filename:
+                continue
+            display_stem = str(row.get("display_stem") or Path(stored_filename).stem)
+            uploaded_at = str(row.get("uploaded_at") or datetime.now().isoformat())
+            items.append({
+                "stored_filename": stored_filename,
+                "display_stem": display_stem,
+                "uploaded_at": uploaded_at,
+                "relative_time": humanize_age(uploaded_at),
+            })
+
+        counts: Dict[str, int] = {}
+        for item in items:
+            stem = item["display_stem"]
+            counts[stem] = counts.get(stem, 0) + 1
+            item["display_label"] = stem if counts[stem] == 1 else f"{stem} ({counts[stem]})"
+        return items
+
     RESUMES_DIR.mkdir(parents=True, exist_ok=True)
     manifest = load_resume_manifest()
     by_file = {row.get("stored_filename"): dict(row) for row in manifest if isinstance(row, dict)}
@@ -366,6 +442,35 @@ def infer_work_mode(title: str, location: str, description: str) -> str:
 _JOBS_ENRICH_CACHE: Optional[Tuple[float, List[Dict[str, Any]], Dict[str, Dict[str, Any]]]] = None
 
 def get_jobs_enriched() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    global _JOBS_ENRICH_CACHE, _SUPABASE_JOBS_CACHE
+
+    if SUPABASE_DB is not None:
+        now_ts = time.time()
+        if _SUPABASE_JOBS_CACHE and (now_ts - _SUPABASE_JOBS_CACHE[0]) < SUPABASE_JOBS_CACHE_TTL_S:
+            return _SUPABASE_JOBS_CACHE[1], _SUPABASE_JOBS_CACHE[2]
+        try:
+            raw = SUPABASE_DB.select("jobs", order="posted_date.desc.nullslast,title.asc", limit=5000)
+            out_list: List[Dict[str, Any]] = []
+            out_map: Dict[str, Dict[str, Any]] = {}
+            for j in raw:
+                if not isinstance(j, dict):
+                    continue
+                jj = dict(j)
+                jj["country"] = str(j.get("country") or infer_country(str(j.get("location", ""))))
+                jj["work_mode"] = str(j.get("work_mode") or infer_work_mode(
+                    str(j.get("title", "")),
+                    str(j.get("location", "")),
+                    str(j.get("description_text", "")),
+                ))
+                out_list.append(jj)
+                jid = str(j.get("job_id", ""))
+                if jid:
+                    out_map[jid] = jj
+            _SUPABASE_JOBS_CACHE = (now_ts, out_list, out_map)
+            return out_list, out_map
+        except Exception as e:
+            _rt_append(LAST_STDERR, f"Supabase jobs fallback to JSON: {repr(e)}")
+
     global _JOBS_ENRICH_CACHE
     if not SCRAPED_JOBS_JSON.exists():
         return [], {}
@@ -720,13 +825,22 @@ def convert_image_to_pdf(image_path: Path, out_pdf_path: Path) -> None:
 @app.get("/")
 def dashboard():
     scanned = safe_load_json(SCANNED_RESUMES_JSON, [])
-    jobs = safe_load_json(SCRAPED_JOBS_JSON, [])
     matches = safe_load_json(MATCHES_JSON, [])
 
+    jobs_count = 0
+    if SUPABASE_DB is not None:
+        try:
+            jobs_count = SUPABASE_DB.count("jobs")
+        except Exception as e:
+            _rt_append(LAST_STDERR, f"Supabase jobs count failed: {repr(e)}")
+    if jobs_count == 0:
+        jobs = safe_load_json(SCRAPED_JOBS_JSON, [])
+        jobs_count = len(jobs) if isinstance(jobs, list) else 0
+
     stats = {
-        "resumes_uploaded": len(list(RESUMES_DIR.glob("*.pdf"))) if RESUMES_DIR.exists() else 0,
+        "resumes_uploaded": get_user_active_resume_count(get_current_user_id()),
         "resumes_scanned": len(scanned) if isinstance(scanned, list) else 0,
-        "jobs_scraped": len(jobs) if isinstance(jobs, list) else 0,
+        "jobs_scraped": jobs_count,
         "matches_rows": len(matches) if isinstance(matches, list) else 0,
     }
     return render_template("dashboard.html", stats=stats)
@@ -734,7 +848,8 @@ def dashboard():
 @app.get("/upload")
 def upload_page():
     resumes = get_active_resume_items()
-    return render_template("upload.html", resumes=resumes, max_resumes=MAX_RESUMES)
+    current_user_id = get_current_user_id()
+    return render_template("upload.html", resumes=resumes, max_resumes=MAX_RESUMES, current_resume_count=get_user_active_resume_count(current_user_id))
 
 @app.post("/upload/resume")
 def upload_resume():
@@ -753,8 +868,9 @@ def upload_resume():
         return redirect(url_for("upload_page"))
 
     RESUMES_DIR.mkdir(parents=True, exist_ok=True)
-    existing_pdfs = sorted(RESUMES_DIR.glob("*.pdf"))
-    if len(existing_pdfs) >= MAX_RESUMES:
+    current_user_id = get_current_user_id()
+    active_resume_count = get_user_active_resume_count(current_user_id)
+    if active_resume_count >= MAX_RESUMES:
         flash(f"You can only keep up to {MAX_RESUMES} resumes for now. Delete one before uploading another.")
         return redirect(url_for("upload_page"))
 
@@ -788,6 +904,25 @@ def upload_resume():
         "uploaded_at": uploaded_at,
     })
     save_resume_manifest(manifest)
+
+    if SUPABASE_DB is not None:
+        try:
+            SUPABASE_DB.upsert_many(
+                "resumes",
+                [{
+                    "stored_filename": stored_filename,
+                    "file_name": f"{safe_stem}.pdf",
+                    "display_stem": safe_stem,
+                    "storage_path": str(out_pdf.relative_to(PROJECT_DIR)).replace("\\", "/"),
+                    "uploaded_at": uploaded_at,
+                    "archived": False,
+                    "archive_filename": None,
+                    "archived_at": None,
+                }],
+                on_conflict="stored_filename",
+            )
+        except Exception as e:
+            _rt_append(LAST_STDERR, f"Supabase resume metadata sync failed: {repr(e)}")
 
     return redirect(url_for("upload_page"))
 
@@ -833,6 +968,24 @@ def delete_resume(stored_filename: str):
         "resume_id": resume_id,
     })
     save_resume_archive_manifest(archive_manifest)
+
+    if SUPABASE_DB is not None:
+        try:
+            current_user_id = get_current_user_id()
+            update_filters = {"stored_filename": f"eq.{stored_filename}"}
+            if current_user_id:
+                update_filters["user_id"] = f"eq.{current_user_id}"
+            SUPABASE_DB.update(
+                "resumes",
+                {
+                    "archived": True,
+                    "archive_filename": archive_name,
+                    "archived_at": datetime.now().isoformat(),
+                },
+                filters=update_filters,
+            )
+        except Exception as e:
+            _rt_append(LAST_STDERR, f"Supabase resume archive sync failed: {repr(e)}")
 
     archive_resume_cache(resume_id)
     remove_resume_from_outputs(resume_id, stored_filename)
@@ -996,6 +1149,30 @@ def jobs_page():
         country_filter=country_filter,
         work_mode_filter=work_mode_filter,
     )
+
+
+@app.get("/api/supabase-status")
+def api_supabase_status():
+    status = {
+        "has_url": bool(os.environ.get("SUPABASE_URL")),
+        "has_secret_key": bool(os.environ.get("SUPABASE_SECRET_KEY")),
+        "jobs_table_available": False,
+        "jobs_count": 0,
+        "resumes_table_available": False,
+    }
+    if SUPABASE_DB is None:
+        return jsonify(status)
+    try:
+        status["jobs_count"] = SUPABASE_DB.count("jobs")
+        status["jobs_table_available"] = True
+    except Exception as e:
+        status["jobs_error"] = repr(e)
+    try:
+        SUPABASE_DB.select("resumes", columns="id", limit=1)
+        status["resumes_table_available"] = True
+    except Exception as e:
+        status["resumes_error"] = repr(e)
+    return jsonify(status)
 
 # ---------------------------
 # API: status only (no /logs, no /download, no /api/tail)
