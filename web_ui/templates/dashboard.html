@@ -1,6 +1,16 @@
 {% extends "base.html" %}
 {% set active = "dashboard" %}
 {% block content %}
+  {% if not logged_in %}
+    <div class="mb-6 rounded-3xl bg-amber-500/10 p-4 text-sm text-amber-100 ring-soft">
+      <div class="font-semibold">Sign in required for uploads and per-user resume limits</div>
+      <div class="mt-1 text-amber-50/80">You can browse jobs now, but uploads, pipeline runs, and the 3-resume limit only work per user after sign in.</div>
+      <div class="mt-3 flex gap-2">
+        <a href="{{ url_for('login_page') }}" class="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold hover:bg-white/15 ring-soft">Sign in</a>
+        <a href="{{ url_for('signup_page') }}" class="rounded-2xl bg-indigo-600 px-4 py-2 text-sm font-semibold hover:bg-indigo-500">Create account</a>
+      </div>
+    </div>
+  {% endif %}
   <div class="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
     <div>
       <h1 class="text-2xl font-semibold">Dashboard</h1>

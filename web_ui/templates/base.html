@@ -30,10 +30,21 @@
         <img src="{{ url_for('static', filename='rolematcher-logo.png') }}" alt="RoleMatcher logo" class="h-10 w-10 rounded-2xl object-cover ring-soft"/>
         <div>
           <div class="text-lg font-semibold leading-tight">RoleMatcher</div>
-          <div class="text-xs text-slate-400">Localhost dashboard (no login yet)</div>
+          <div class="text-xs text-slate-400">{% if is_logged_in %}Signed in as {{ current_user_email }}{% else %}Sign in to keep resumes separate per user{% endif %}</div>
         </div>
       </div>
 
+      <div class="flex items-center gap-2">
+        {% if is_logged_in %}
+          <span class="hidden rounded-2xl bg-white/5 px-3 py-2 text-xs text-slate-300 ring-soft sm:inline-block">{{ current_user_email }}</span>
+          <form method="post" action="{{ url_for('logout_submit') }}">
+            <button type="submit" class="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold hover:bg-white/15 ring-soft">Sign out</button>
+          </form>
+        {% else %}
+          <a href="{{ url_for('login_page') }}" class="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold hover:bg-white/15 ring-soft">Sign in</a>
+          <a href="{{ url_for('signup_page') }}" class="rounded-2xl bg-indigo-600 px-4 py-2 text-sm font-semibold hover:bg-indigo-500">Create account</a>
+        {% endif %}
+      </div>
     </div>
 
     <!-- Flash messages -->
@@ -73,12 +84,26 @@
              class="flex items-center justify-between rounded-2xl px-3 py-2 text-sm hover:bg-white/5 {% if active=='jobs' %}bg-white/5{% endif %}">
             <span>Jobs</span><span class="text-slate-400">☰</span>
           </a>
+          {% if not is_logged_in %}
+            <a href="{{ url_for('login_page') }}"
+               class="flex items-center justify-between rounded-2xl px-3 py-2 text-sm hover:bg-white/5 {% if active=='login' %}bg-white/5{% endif %}">
+              <span>Sign in</span><span class="text-slate-400">→</span>
+            </a>
+            <a href="{{ url_for('signup_page') }}"
+               class="flex items-center justify-between rounded-2xl px-3 py-2 text-sm hover:bg-white/5 {% if active=='signup' %}bg-white/5{% endif %}">
+              <span>Create account</span><span class="text-slate-400">+</span>
+            </a>
+          {% endif %}
         </nav>
 
         <div class="mt-4 rounded-2xl bg-white/5 p-3 text-xs text-slate-300">
           <div class="font-semibold text-slate-200">Tip</div>
           <div class="mt-1 text-slate-400">
-            Upload PDFs (or images → auto-convert to PDF), run <b>Resume OCR</b>, then <b>Job Matcher</b>.
+            {% if is_logged_in %}
+              Upload PDFs (or images → auto-convert to PDF), run <b>Resume OCR</b>, then <b>Job Matcher</b>.
+            {% else %}
+              Create an account, verify your email, then sign in to keep your resumes under your own account.
+            {% endif %}
           </div>
         </div>
       </aside>

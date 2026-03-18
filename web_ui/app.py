@@ -10,6 +10,7 @@ import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from functools import wraps
 import hashlib
 import shutil
 import sqlite3
@@ -19,7 +20,7 @@ from flask import Flask, render_template, request, redirect, url_for, flash, jso
 from werkzeug.utils import secure_filename
 from PIL import Image
 
-from web_ui.supabase_db import get_supabase_db
+from web_ui.supabase_db import get_supabase_auth, get_supabase_db
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = APP_DIR.parent
@@ -52,6 +53,7 @@ ALLOWED_RESUME_EXTS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
 SUPABASE_DB = get_supabase_db()
+SUPABASE_AUTH = get_supabase_auth()
 _SUPABASE_JOBS_CACHE: Optional[Tuple[float, List[Dict[str, Any]], Dict[str, Dict[str, Any]]]] = None
 SUPABASE_JOBS_CACHE_TTL_S = int(os.environ.get("SUPABASE_JOBS_CACHE_TTL_S", "60"))
 
@@ -134,10 +136,52 @@ def get_current_user_id() -> Optional[str]:
     user_id = session.get("user_id")
     if isinstance(user_id, str) and user_id.strip():
         return user_id.strip()
-    header_user_id = request.headers.get("X-User-Id", "").strip()
-    if header_user_id:
-        return header_user_id
     return None
+
+
+def get_current_user_email() -> str:
+    email = session.get("user_email")
+    return email.strip() if isinstance(email, str) else ""
+
+
+def is_logged_in() -> bool:
+    return bool(get_current_user_id())
+
+
+def login_required(view_func):
+    @wraps(view_func)
+    def wrapped(*args, **kwargs):
+        if not is_logged_in():
+            flash("Please sign in first.")
+            return redirect(url_for("login_page", next=request.path))
+        return view_func(*args, **kwargs)
+    return wrapped
+
+
+def auth_redirect_target() -> str:
+    configured = (os.environ.get("SUPABASE_AUTH_REDIRECT_URL") or "").strip()
+    if configured:
+        return configured
+    return url_for("login_page", confirmed="1", _external=True)
+
+
+def set_logged_in_session(auth_payload: Dict[str, Any]) -> None:
+    user = auth_payload.get("user") if isinstance(auth_payload, dict) else {}
+    if not isinstance(user, dict):
+        user = {}
+    session["user_id"] = str(user.get("id") or "")
+    session["user_email"] = str(user.get("email") or "")
+    session["access_token"] = str(auth_payload.get("access_token") or "")
+    session["refresh_token"] = str(auth_payload.get("refresh_token") or "")
+
+
+@app.context_processor
+def inject_auth_state():
+    return {
+        "is_logged_in": is_logged_in(),
+        "current_user_email": get_current_user_email(),
+        "current_user_id": get_current_user_id(),
+    }
 
 
 def get_user_active_resume_count(user_id: Optional[str]) -> int:
@@ -820,6 +864,85 @@ def convert_image_to_pdf(image_path: Path, out_pdf_path: Path) -> None:
 
 
 # ---------------------------
+# Auth
+# ---------------------------
+@app.get("/auth/signup")
+def signup_page():
+    return render_template("signup.html", title="Sign up")
+
+
+@app.post("/auth/signup")
+def signup_submit():
+    if SUPABASE_AUTH is None:
+        flash("Supabase auth is not configured yet. Add SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY in Render.")
+        return redirect(url_for("signup_page"))
+
+    email = (request.form.get("email") or "").strip().lower()
+    password = request.form.get("password") or ""
+    confirm = request.form.get("confirm_password") or ""
+
+    if not email:
+        flash("Please enter an email address.")
+        return redirect(url_for("signup_page"))
+    if len(password) < 8:
+        flash("Password must be at least 8 characters.")
+        return redirect(url_for("signup_page"))
+    if password != confirm:
+        flash("Passwords do not match.")
+        return redirect(url_for("signup_page"))
+
+    try:
+        SUPABASE_AUTH.sign_up(email, password, email_redirect_to=auth_redirect_target())
+        flash("Account created. Check your email and click the verification link, then sign in.")
+        return redirect(url_for("login_page"))
+    except Exception as e:
+        flash(f"Sign up failed: {e}")
+        return redirect(url_for("signup_page"))
+
+
+@app.get("/auth/login")
+def login_page():
+    if request.args.get("confirmed") == "1":
+        flash("Email confirmed. You can sign in now.")
+    return render_template("login.html", title="Sign in", next_url=(request.args.get("next") or ""))
+
+
+@app.post("/auth/login")
+def login_submit():
+    if SUPABASE_AUTH is None:
+        flash("Supabase auth is not configured yet. Add SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY in Render.")
+        return redirect(url_for("login_page"))
+
+    email = (request.form.get("email") or "").strip().lower()
+    password = request.form.get("password") or ""
+    next_url = (request.form.get("next") or "").strip()
+    if not email or not password:
+        flash("Enter your email and password.")
+        return redirect(url_for("login_page", next=next_url))
+
+    try:
+        auth_payload = SUPABASE_AUTH.sign_in_password(email, password)
+        set_logged_in_session(auth_payload)
+        flash("Signed in.")
+        if next_url and next_url.startswith("/"):
+            return redirect(next_url)
+        return redirect(url_for("dashboard"))
+    except Exception as e:
+        flash(f"Sign in failed: {e}")
+        return redirect(url_for("login_page", next=next_url))
+
+
+@app.post("/auth/logout")
+def logout_submit():
+    session.pop("user_id", None)
+    session.pop("user_email", None)
+    session.pop("access_token", None)
+    session.pop("refresh_token", None)
+    flash("Signed out.")
+    return redirect(url_for("login_page"))
+
+
+# ---------------------------
 # Pages
 # ---------------------------
 @app.get("/")
@@ -830,7 +953,7 @@ def dashboard():
     jobs_count = 0
     if SUPABASE_DB is not None:
         try:
-            jobs_count = SUPABASE_DB.count("jobs")
+            jobs_count = SUPABASE_DB.count("jobs", count_column="job_id")
         except Exception as e:
             _rt_append(LAST_STDERR, f"Supabase jobs count failed: {repr(e)}")
     if jobs_count == 0:
@@ -843,15 +966,17 @@ def dashboard():
         "jobs_scraped": jobs_count,
         "matches_rows": len(matches) if isinstance(matches, list) else 0,
     }
-    return render_template("dashboard.html", stats=stats)
+    return render_template("dashboard.html", stats=stats, logged_in=is_logged_in())
 
 @app.get("/upload")
+@login_required
 def upload_page():
     resumes = get_active_resume_items()
     current_user_id = get_current_user_id()
     return render_template("upload.html", resumes=resumes, max_resumes=MAX_RESUMES, current_resume_count=get_user_active_resume_count(current_user_id))
 
 @app.post("/upload/resume")
+@login_required
 def upload_resume():
     if "file" not in request.files:
         flash("No file selected.")
@@ -907,18 +1032,21 @@ def upload_resume():
 
     if SUPABASE_DB is not None:
         try:
+            row_payload = {
+                "stored_filename": stored_filename,
+                "file_name": f"{safe_stem}.pdf",
+                "display_stem": safe_stem,
+                "storage_path": str(out_pdf.relative_to(PROJECT_DIR)).replace("\\", "/"),
+                "uploaded_at": uploaded_at,
+                "archived": False,
+                "archive_filename": None,
+                "archived_at": None,
+            }
+            if current_user_id:
+                row_payload["user_id"] = current_user_id
             SUPABASE_DB.upsert_many(
                 "resumes",
-                [{
-                    "stored_filename": stored_filename,
-                    "file_name": f"{safe_stem}.pdf",
-                    "display_stem": safe_stem,
-                    "storage_path": str(out_pdf.relative_to(PROJECT_DIR)).replace("\\", "/"),
-                    "uploaded_at": uploaded_at,
-                    "archived": False,
-                    "archive_filename": None,
-                    "archived_at": None,
-                }],
+                [row_payload],
                 on_conflict="stored_filename",
             )
         except Exception as e:
@@ -928,6 +1056,7 @@ def upload_resume():
 
 
 @app.post("/upload/delete/<path:stored_filename>")
+@login_required
 def delete_resume(stored_filename: str):
     stored_filename = Path(stored_filename).name
     resume_path = RESUMES_DIR / stored_filename
@@ -993,10 +1122,12 @@ def delete_resume(stored_filename: str):
     return redirect(url_for("upload_page"))
 
 @app.get("/run")
+@login_required
 def run_page():
     return render_template("run.html")
 
 @app.post("/run/pipeline")
+@login_required
 def run_pipeline():
     # Start button always runs Resume OCR + Job Matcher together.
     # Job scraping is intentionally disabled from the UI.
@@ -1012,6 +1143,7 @@ def run_pipeline():
     return redirect(url_for("run_page"))
 
 @app.get("/results")
+@login_required
 def results_page():
     grouped, resume_ids = get_matches_grouped()
     rid_name = resume_id_to_name()
@@ -1156,6 +1288,8 @@ def api_supabase_status():
     status = {
         "has_url": bool(os.environ.get("SUPABASE_URL")),
         "has_secret_key": bool(os.environ.get("SUPABASE_SECRET_KEY")),
+        "has_publishable_key": bool(os.environ.get("SUPABASE_PUBLISHABLE_KEY")),
+        "auth_configured": SUPABASE_AUTH is not None,
         "jobs_table_available": False,
         "jobs_count": 0,
         "resumes_table_available": False,
@@ -1163,7 +1297,7 @@ def api_supabase_status():
     if SUPABASE_DB is None:
         return jsonify(status)
     try:
-        status["jobs_count"] = SUPABASE_DB.count("jobs")
+        status["jobs_count"] = SUPABASE_DB.count("jobs", count_column="job_id")
         status["jobs_table_available"] = True
     except Exception as e:
         status["jobs_error"] = repr(e)
