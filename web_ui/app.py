@@ -7,7 +7,7 @@ import sys
 import time
 import threading
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from functools import wraps
@@ -162,7 +162,8 @@ def auth_redirect_target() -> str:
     configured = (os.environ.get("SUPABASE_AUTH_REDIRECT_URL") or "").strip()
     if configured:
         return configured
-    return url_for("login_page", confirmed="1", _external=True)
+    base = (request.url_root or "").rstrip("/")
+    return f"{base}{url_for('auth_confirmed')}"
 
 
 def set_logged_in_session(auth_payload: Dict[str, Any]) -> None:
@@ -223,7 +224,11 @@ def humanize_age(uploaded_at: str) -> str:
         dt = datetime.fromisoformat(uploaded_at)
     except Exception:
         return "awhile ago"
-    delta = datetime.now() - dt
+    if dt.tzinfo is None:
+        now_dt = datetime.now()
+    else:
+        now_dt = datetime.now(dt.tzinfo)
+    delta = now_dt - dt
     seconds = max(0, int(delta.total_seconds()))
     minutes = seconds // 60
     hours = seconds // 3600
@@ -701,6 +706,12 @@ def run_script_streaming(script_path: Path, timeout_s: int = 1800) -> Dict[str, 
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
+    env.setdefault("TOKENIZERS_PARALLELISM", "false")
+    env.setdefault("OMP_NUM_THREADS", "1")
+    env.setdefault("OPENBLAS_NUM_THREADS", "1")
+    env.setdefault("MKL_NUM_THREADS", "1")
+    env.setdefault("NUMEXPR_NUM_THREADS", "1")
+    env.setdefault("ROLEMATCHER_LOW_MEMORY", "1")
 
     cmd = [sys.executable, "-u", str(script_path)]
     _rt_append(LAST_STDOUT, f"\n===== START {script_path.name} @ {datetime.now().strftime('%Y-%m-%d %I:%M %p')} =====")
@@ -893,11 +904,17 @@ def signup_submit():
 
     try:
         SUPABASE_AUTH.sign_up(email, password, email_redirect_to=auth_redirect_target())
-        flash("Account created. Check your email and click the verification link, then sign in.")
+        flash("Account created. Check your email and click the verification link, then come back here and sign in.")
         return redirect(url_for("login_page"))
     except Exception as e:
         flash(f"Sign up failed: {e}")
         return redirect(url_for("signup_page"))
+
+
+@app.get("/auth/confirmed")
+def auth_confirmed():
+    flash("Email confirmed. You can sign in now.")
+    return redirect(url_for("login_page", confirmed="1"))
 
 
 @app.get("/auth/login")
@@ -953,7 +970,7 @@ def dashboard():
     jobs_count = 0
     if SUPABASE_DB is not None:
         try:
-            jobs_count = SUPABASE_DB.count("jobs", count_column="job_id")
+            jobs_count = len(get_jobs_enriched()[0])
         except Exception as e:
             _rt_append(LAST_STDERR, f"Supabase jobs count failed: {repr(e)}")
     if jobs_count == 0:
@@ -1000,7 +1017,7 @@ def upload_resume():
         return redirect(url_for("upload_page"))
 
     safe_stem = secure_filename(Path(f.filename).stem) or "resume"
-    uploaded_at = datetime.now().isoformat()
+    uploaded_at = datetime.now(timezone.utc).isoformat()
     stored_filename = make_timestamped_pdf_name(f.filename)
     out_pdf = RESUMES_DIR / stored_filename
 
@@ -1092,8 +1109,8 @@ def delete_resume(stored_filename: str):
         "stored_filename": stored_filename,
         "archive_filename": archive_name,
         "display_stem": str((row or {}).get("display_stem") or Path(stored_filename).stem),
-        "uploaded_at": str((row or {}).get("uploaded_at") or datetime.now().isoformat()),
-        "archived_at": datetime.now().isoformat(),
+        "uploaded_at": str((row or {}).get("uploaded_at") or datetime.now(timezone.utc).isoformat()),
+        "archived_at": datetime.now(timezone.utc).isoformat(),
         "resume_id": resume_id,
     })
     save_resume_archive_manifest(archive_manifest)
@@ -1109,7 +1126,7 @@ def delete_resume(stored_filename: str):
                 {
                     "archived": True,
                     "archive_filename": archive_name,
-                    "archived_at": datetime.now().isoformat(),
+                    "archived_at": datetime.now(timezone.utc).isoformat(),
                 },
                 filters=update_filters,
             )
@@ -1297,7 +1314,7 @@ def api_supabase_status():
     if SUPABASE_DB is None:
         return jsonify(status)
     try:
-        status["jobs_count"] = SUPABASE_DB.count("jobs", count_column="job_id")
+        status["jobs_count"] = len(get_jobs_enriched()[0])
         status["jobs_table_available"] = True
     except Exception as e:
         status["jobs_error"] = repr(e)

@@ -16,9 +16,12 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
+LOW_MEMORY_MODE = os.environ.get("ROLEMATCHER_LOW_MEMORY", "0").strip().lower() in {"1", "true", "yes", "on"}
+DISABLE_SENTENCE_TRANSFORMERS = os.environ.get("ROLEMATCHER_DISABLE_ST", "0").strip().lower() in {"1", "true", "yes", "on"}
+
 try:
     from sentence_transformers import SentenceTransformer, util
-    HAVE_SENTENCE_TRANSFORMERS = True
+    HAVE_SENTENCE_TRANSFORMERS = not DISABLE_SENTENCE_TRANSFORMERS and not LOW_MEMORY_MODE
 except Exception:
     SentenceTransformer = None
     util = None
@@ -45,6 +48,14 @@ SCORE_CHUNK_MIN_ROWS = 256
 MAX_SCORE_WORKERS = min(8, max(2, (os.cpu_count() or 4)))
 JOB_EMBED_BATCH_SIZE = 128
 RESUME_EMBED_BATCH_SIZE = 32
+
+if LOW_MEMORY_MODE:
+    LEXICAL_PREFILTER_MIN_PENDING = 999999
+    LEXICAL_PREFILTER_TOP_K = 80
+    SCORE_CHUNK_MIN_ROWS = 128
+    MAX_SCORE_WORKERS = 1
+    JOB_EMBED_BATCH_SIZE = 32
+    RESUME_EMBED_BATCH_SIZE = 8
 
 JOB_YEARS_PATTERNS = [
     r"(?P<num>\d+(?:\.\d+)?)\s*(?:\+|\bplus\b)?\s*(?:years|year|yrs|yr)\s*(?:of\s*)?experience",
@@ -639,6 +650,8 @@ def run() -> None:
     log_stage("prepare_jobs", prep_start)
 
     model = None
+    if LOW_MEMORY_MODE:
+        print("Low-memory mode enabled. Using lighter OCR/matching settings.")
     if HAVE_SENTENCE_TRANSFORMERS:
         model_start = time.perf_counter()
         print(f"Using SentenceTransformer model: {MODEL_NAME}")

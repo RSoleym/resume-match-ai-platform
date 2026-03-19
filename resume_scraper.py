@@ -6,7 +6,7 @@ from datetime import date
 from concurrent.futures import ThreadPoolExecutor
 
 import pytesseract
-from pdf2image import convert_from_path
+from pdf2image import convert_from_path, pdfinfo_from_path
 from PIL import Image
 
 # ======================
@@ -156,16 +156,39 @@ def wrap_bullets(lines: list[str]) -> list[str]:
 # OCR
 # ======================
 def ocr_pdf(path: str) -> str:
-    images = convert_from_path(path, dpi=250)
     def ocr_one(img):
         gray = img.convert("L")
         return pytesseract.image_to_string(gray, config=TESSERACT_CONFIG)
-    max_workers = max(1, min(4, len(images)))
-    if max_workers == 1:
-        pages = [ocr_one(img) for img in images]
-    else:
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            pages = list(ex.map(ocr_one, images))
+
+    pages = []
+    try:
+        info = pdfinfo_from_path(path)
+        page_count = int(info.get("Pages", 0) or 0)
+    except Exception:
+        page_count = 0
+
+    if page_count <= 0:
+        images = convert_from_path(path, dpi=200, thread_count=1)
+        for img in images:
+            try:
+                pages.append(ocr_one(img))
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
+        return "\n".join(pages)
+
+    for page_num in range(1, page_count + 1):
+        images = convert_from_path(path, dpi=200, first_page=page_num, last_page=page_num, thread_count=1)
+        for img in images:
+            try:
+                pages.append(ocr_one(img))
+            finally:
+                try:
+                    img.close()
+                except Exception:
+                    pass
     return "\n".join(pages)
 
 # ======================
