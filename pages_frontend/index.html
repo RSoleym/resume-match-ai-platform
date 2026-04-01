@@ -229,9 +229,13 @@
                     <div class="flex items-center justify-between gap-3 max-sm:flex-col max-sm:items-start">
                       <div>
                         <div class="text-sm font-semibold text-slate-200">Free pipeline</div>
-                        <div class="mt-1 text-xs text-slate-400">Use the live shell now. Wire browser OCR and matching next.</div>
+                        <div class="mt-1 text-xs text-slate-400">Runs browser-side PDF reading, OCR, and local semantic matching on the user device.</div>
                       </div>
                       <button id="freeRunButton" type="submit" class="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold hover:bg-indigo-500">Start</button>
+                    </div>
+                    <div class="mt-3 rounded-2xl bg-black/20 p-4 ring-soft">
+                      <div id="freeRunStatus" class="text-sm text-slate-300">Browser pipeline idle.</div>
+                      <div class="mt-3 h-2 w-full rounded-full bg-black/30 ring-soft"><div id="freeRunProgressFill" class="h-2 rounded-full bg-gradient-to-r from-indigo-500 to-fuchsia-500" style="width:0%"></div></div>
                     </div>
                     <div id="freeRunMessage" class="mt-3 hidden rounded-2xl px-4 py-3 text-sm"></div>
                   </div>
@@ -245,7 +249,7 @@
               <div class="rounded-3xl bg-white/5 p-5 ring-soft">
                 <div class="text-sm font-semibold">Premium pipeline</div>
                 <div class="mt-4 space-y-3 text-sm text-slate-300">
-                  <div class="rounded-2xl bg-black/20 px-4 py-3 ring-soft">Use your uploaded resume automatically.</div>
+                  <div class="rounded-2xl bg-black/20 px-4 py-3 ring-soft">Uses your uploaded resume, local browser pre-ranking, then the secure premium backend.</div>
                   <div class="rounded-2xl bg-black/20 px-4 py-3 ring-soft">Premium keys stay out of the browser.</div>
                   <div class="rounded-2xl bg-black/20 px-4 py-3 ring-soft">Saved premium results appear in the Premium page.</div>
                 </div>
@@ -253,7 +257,7 @@
 
               <div class="rounded-3xl bg-white/5 p-5 ring-soft">
                 <form id="premiumRunForm" class="grid gap-3 lg:grid-cols-2">
-                  <input id="premiumCountryInput" type="text" placeholder="Country" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft"/>
+                  <select id="premiumCountryInput" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft"><option value="">All countries</option></select>
                   <input id="premiumRegionInput" type="text" placeholder="City or location" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft"/>
                   <select id="premiumWorkModeInput" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft">
                     <option value="">All work modes</option>
@@ -267,6 +271,10 @@
                     <option value="week">Past week</option>
                   </select>
                   <button id="premiumRunButton" class="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold hover:bg-indigo-500 lg:col-span-2" type="submit">Run</button>
+                  <div class="rounded-2xl bg-black/20 p-4 ring-soft lg:col-span-2">
+                    <div id="premiumRunStatus" class="text-sm text-slate-300">Premium pipeline idle.</div>
+                    <div class="mt-3 h-2 w-full rounded-full bg-black/30 ring-soft"><div id="premiumRunProgressFill" class="h-2 rounded-full bg-gradient-to-r from-indigo-500 to-fuchsia-500" style="width:0%"></div></div>
+                  </div>
                   <div id="premiumRunMessage" class="hidden rounded-2xl px-4 py-3 text-sm lg:col-span-2"></div>
                 </form>
               </div>
@@ -422,6 +430,7 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="browser-pipeline-client.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

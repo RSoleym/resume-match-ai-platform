@@ -55,9 +55,13 @@ const dom = {
   freeRunForm: document.getElementById('freeRunForm'),
   freeRunButton: document.getElementById('freeRunButton'),
   freeRunMessage: document.getElementById('freeRunMessage'),
+  freeRunStatus: document.getElementById('freeRunStatus'),
+  freeRunProgressFill: document.getElementById('freeRunProgressFill'),
   premiumRunForm: document.getElementById('premiumRunForm'),
   premiumRunButton: document.getElementById('premiumRunButton'),
   premiumRunMessage: document.getElementById('premiumRunMessage'),
+  premiumRunStatus: document.getElementById('premiumRunStatus'),
+  premiumRunProgressFill: document.getElementById('premiumRunProgressFill'),
   runTabs: Array.from(document.querySelectorAll('.run-tab-btn')),
   runPanels: Array.from(document.querySelectorAll('.run-tab-panel')),
   locationMode: document.getElementById('locationMode'),
@@ -85,6 +89,10 @@ const dom = {
   premiumUnlockForm: document.getElementById('premiumUnlockForm'),
   premiumCodeInput: document.getElementById('premiumCodeInput'),
   premiumUnlockMessage: document.getElementById('premiumUnlockMessage'),
+  premiumCountryInput: document.getElementById('premiumCountryInput'),
+  premiumRegionInput: document.getElementById('premiumRegionInput'),
+  premiumWorkModeInput: document.getElementById('premiumWorkModeInput'),
+  premiumPostedInput: document.getElementById('premiumPostedInput'),
   premiumFilterForm: document.getElementById('premiumFilterForm'),
   premiumCountryFilter: document.getElementById('premiumCountryFilter'),
   premiumRegionFilter: document.getElementById('premiumRegionFilter'),
@@ -115,6 +123,13 @@ function setBusy(button, busy, idleLabel, busyLabel) {
   if (!button) return;
   button.disabled = !!busy;
   button.textContent = busy ? busyLabel : idleLabel;
+}
+
+function updatePipelineUi(statusEl, fillEl, message, progress = null) {
+  if (statusEl && message) statusEl.textContent = message;
+  if (fillEl && progress !== null && Number.isFinite(Number(progress))) {
+    fillEl.style.width = `${Math.max(0, Math.min(100, Number(progress)))}%`;
+  }
 }
 
 async function getSupabaseClient() {
@@ -253,6 +268,9 @@ function initCountryPicker() {
     dom.countryPicker.appendChild(opt);
   });
   dom.premiumCountryFilter.innerHTML = '<option value="">All countries</option>' + COUNTRY_OPTIONS.map((c) => `<option value="${c}">${c}</option>`).join('');
+  if (dom.premiumCountryInput) {
+    dom.premiumCountryInput.innerHTML = '<option value="">All countries</option>' + COUNTRY_OPTIONS.map((c) => `<option value="${c}">${c}</option>`).join('');
+  }
 }
 
 let selectedCountries = [];
@@ -742,27 +760,94 @@ function setRunTab(tab) {
   });
 }
 
-function handleFreeRun(event) {
+async function handleFreeRun(event) {
   event.preventDefault();
-  showMessage(dom.freeRunMessage, 'Free pipeline shell is ready. Browser OCR and matching are the next wiring step.', 'info');
+  clearMessage(dom.freeRunMessage);
+  updatePipelineUi(dom.freeRunStatus, dom.freeRunProgressFill, 'Checking browser pipeline…', 4);
+  setBusy(dom.freeRunButton, true, 'Start', 'Running browser pipeline...');
+  try {
+    if (!window.ResumeBrowserPipeline) throw new Error('Browser pipeline client is missing from the frontend.');
+    if (!activeSession?.user?.id) throw new Error('Sign in before running the browser pipeline.');
+    const resume = resumesCache[0];
+    if (!resume?.id) throw new Error('Upload a resume first.');
+
+    const result = await window.ResumeBrowserPipeline.runFreePipeline({
+      supabaseClient,
+      session: activeSession,
+      resumeRow: resume,
+      locationMode: dom.locationMode.value,
+      selectedCountries,
+      onProgress: ({ message, progress }) => updatePipelineUi(dom.freeRunStatus, dom.freeRunProgressFill, message, progress),
+    });
+
+    await refreshAll();
+    showMessage(dom.freeRunMessage, `Saved ${result.results.length} browser-scored matches.`, 'success');
+    updatePipelineUi(dom.freeRunStatus, dom.freeRunProgressFill, 'Browser pipeline finished. Results are ready.', 100);
+    switchView('results');
+  } catch (err) {
+    showMessage(dom.freeRunMessage, err.message || 'Free browser pipeline failed.', 'error');
+    updatePipelineUi(dom.freeRunStatus, dom.freeRunProgressFill, err.message || 'Free browser pipeline failed.', 0);
+  } finally {
+    setBusy(dom.freeRunButton, false, 'Start', 'Running browser pipeline...');
+  }
 }
 
-function handlePremiumRun(event) {
+async function handlePremiumRun(event) {
   event.preventDefault();
-  showMessage(dom.premiumRunMessage, 'Premium run shell is ready. Wire the secure premium path next.', 'info');
+  clearMessage(dom.premiumRunMessage);
+  updatePipelineUi(dom.premiumRunStatus, dom.premiumRunProgressFill, 'Checking premium backend…', 4);
+  setBusy(dom.premiumRunButton, true, 'Run', 'Running premium...');
+  try {
+    if (!window.ResumeBrowserPipeline) throw new Error('Browser pipeline client is missing from the frontend.');
+    if (!activeSession?.user?.id) throw new Error('Sign in before running premium.');
+    const resume = resumesCache[0];
+    if (!resume?.id) throw new Error('Upload a resume first.');
+
+    const result = await window.ResumeBrowserPipeline.runPremiumPipeline({
+      supabaseClient,
+      session: activeSession,
+      resumeRow: resume,
+      filters: {
+        country: dom.premiumCountryInput?.value || '',
+        region: dom.premiumRegionInput?.value?.trim() || '',
+        workMode: dom.premiumWorkModeInput?.value || '',
+        posted: dom.premiumPostedInput?.value || 'all',
+      },
+      onProgress: ({ message, progress }) => updatePipelineUi(dom.premiumRunStatus, dom.premiumRunProgressFill, message, progress),
+    });
+
+    await refreshAll();
+    showMessage(dom.premiumRunMessage, `Saved ${Array.isArray(result.results) ? result.results.length : 0} premium matches.`, 'success');
+    updatePipelineUi(dom.premiumRunStatus, dom.premiumRunProgressFill, 'Premium run finished. Saved to the Premium page.', 100);
+    switchView('premium');
+  } catch (err) {
+    showMessage(dom.premiumRunMessage, err.message || 'Premium run failed.', 'error');
+    updatePipelineUi(dom.premiumRunStatus, dom.premiumRunProgressFill, err.message || 'Premium run failed.', 0);
+  } finally {
+    setBusy(dom.premiumRunButton, false, 'Run', 'Running premium...');
+  }
 }
 
-function handlePremiumUnlock(event) {
+async function handlePremiumUnlock(event) {
   event.preventDefault();
   const code = dom.premiumCodeInput.value.trim();
   if (!code) {
     showMessage(dom.premiumUnlockMessage, 'Enter a premium code.', 'error');
     return;
   }
-  showMessage(dom.premiumUnlockMessage, 'Premium unlock should stay behind a secure backend check.', 'info');
+  try {
+    if (!window.ResumeBrowserPipeline) throw new Error('Browser pipeline client is missing from the frontend.');
+    await window.ResumeBrowserPipeline.unlockPremium({ supabaseClient, code });
+    dom.premiumCodeInput.value = '';
+    await refreshAll();
+    showMessage(dom.premiumUnlockMessage, 'Premium unlocked.', 'success');
+  } catch (err) {
+    showMessage(dom.premiumUnlockMessage, err.message || 'Premium unlock failed.', 'error');
+  }
 }
 
 function attachEvents() {
+
   window.addEventListener('hashchange', () => switchView(currentViewFromHash()));
   dom.fileInput?.addEventListener('change', previewSelectedFile);
   dom.loginForm?.addEventListener('submit', handleLogin);

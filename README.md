@@ -1,26 +1,87 @@
-# Job Finder / RoleMatcher
+# resume-match-ai-platform
 
-Job matching platform with a Python reference app, Supabase schema/setup scripts, admin utilities, and a Cloudflare Pages frontend.
+Resume matching platform with two paths kept in the same repo:
+
+- **Website path (current target):** Cloudflare Pages frontend + browser-side heavy compute + thin Cloudflare backend + Supabase
+- **Local reference path:** the original Python OCR/matching pipeline kept in the repo for local demos and recruiter/project walkthroughs
+
+## Current architecture
+
+### Browser / client-side heavy pipeline
+The deployed website now pushes the heavy **free-path** work onto the user's device:
+
+- PDF text extraction in the browser with **PDF.js**
+- OCR fallback in the browser with **Tesseract.js**
+- local scoring/ranking in a browser worker
+- browser-side semantic rerank attempt with a browser-compatible embedding model
+- final results saved back to Supabase
+
+### Thin backend
+Cloudflare Pages Functions now only handle thin secure tasks:
+
+- public Supabase config
+- dashboard counts
+- candidate job fetch for the browser pipeline
+- premium code unlock
+- premium rerank requests with the private OpenAI key
+
+### Database / storage
+Supabase is still used for:
+
+- auth
+- resumes table + storage bucket
+- jobs table
+- free match results
+- premium match results
+- profile premium flags / usage counts
 
 ## Project layout
 
-- `pages_frontend/` — Cloudflare Pages frontend with Supabase auth, upload flow, and public config function
-- `web_ui/` — Flask reference app, templates, static assets, Supabase helpers, and premium helper code
-- `job_matcher.py` — ranking pipeline used by the Python app after resume text extraction
-- `resume_scraper.py` — OCR and resume parsing pipeline used by the Python app
-- `matcher_taxonomy.py` / `semantic_role_classifier.py` / `shared_model_registry.py` — role classification, taxonomy enrichment, and shared model loading
-- `scripts/` — maintenance utilities such as Supabase job upserts and local health checks
+- `pages_frontend/` — deployed website frontend + browser worker + Cloudflare Pages Functions
+- `web_ui/` — original Flask reference app kept for local/server demos
+- `resume_scraper.py` — original Python OCR/reference pipeline
+- `job_matcher.py` — original Python ranking/reference pipeline
+- `semantic_role_classifier.py` / `shared_model_registry.py` — original Python semantic/reference components
+- `scripts/` — admin/util scripts such as job upserts
 - `supabase_sql/` — ordered Supabase schema and policy scripts
 
-## Included in this sanitized repo
+## What changed in this version
 
-- real environment files were removed
-- local virtual environments and runtime outputs were removed
-- cached match outputs, resume workspaces, archives, and local databases were removed
-- duplicate legacy SQL files were removed in favor of `supabase_sql/`
-- local JSON data snapshots were removed so the repo stays lightweight and Supabase remains the primary source of truth for jobs and user data
+### Website path
+Added a browser-first pipeline that matches the architecture discussed in chat:
 
-## Quick start for the Python app
+- website stays a **website**, not an app
+- heavy free-path work runs on the **user's CPU/RAM**
+- premium secrets stay backend-only
+- original Python scripts remain in the repo as the local first implementation/reference path
+
+Main added files:
+
+- `pages_frontend/browser-pipeline-client.js`
+- `pages_frontend/browser-pipeline-worker.js`
+- `pages_frontend/functions/api/jobs-candidate-set.js`
+- `pages_frontend/functions/api/premium-unlock.js`
+- `pages_frontend/functions/api/premium-run.js`
+
+## Quick start for the website path
+
+### Cloudflare Pages settings
+- **Root directory:** `pages_frontend`
+- **Build command:** leave blank
+- **Build output directory:** `.`
+
+### Required Cloudflare environment variables / secrets
+Set these in Cloudflare Pages / Workers:
+
+- `SUPABASE_URL`
+- `SUPABASE_ANON_KEY`
+- `SUPABASE_SECRET_KEY`
+- `OPENAI_API_KEY` for premium backend calls
+- `OPENAI_MODEL` optional, defaults to `gpt-4o-mini`
+- `PREMIUM_ACCESS_CODE`
+- `PREMIUM_ADMIN_CODE`
+
+## Quick start for the Python reference path
 
 ```bash
 python -m venv .venv
@@ -31,30 +92,6 @@ python wsgi.py
 ```
 
 Open `http://127.0.0.1:5000`.
-
-## Quick start for the Cloudflare Pages frontend
-
-- Cloudflare Pages root directory: `pages_frontend`
-- Build command: leave blank
-- Build output directory: `.`
-- Required Cloudflare variables: `SUPABASE_URL`, `SUPABASE_ANON_KEY`
-
-## Environment variables
-
-Set these in `.env` locally and in your deployment environment where applicable:
-
-- `SECRET_KEY`
-- `SUPABASE_URL`
-- `SUPABASE_PUBLISHABLE_KEY` for the Python app
-- `SUPABASE_ANON_KEY` for the Pages frontend
-- `SUPABASE_SECRET_KEY`
-- `SUPABASE_AUTH_REDIRECT_URL`
-- `SUPABASE_RESUMES_BUCKET`
-- `SUPABASE_ACTIVE_PREFIX`
-- `SUPABASE_ARCHIVE_PREFIX`
-- `MAX_RESUMES`
-- `OPENAI_API_KEY` if premium OpenAI-backed features are enabled
-- `PREMIUM_ACCESS_CODE` / `PREMIUM_ADMIN_CODE` if code-based premium unlocks are enabled
 
 ## Supabase setup
 
@@ -73,15 +110,16 @@ python scripts/jobs_update.py
 
 By default it reads `scraped_jobs.json` from your local machine if present. You can also point it to any file with `SCRAPED_JOBS_FILE=...`.
 
-## Placeholder runtime directories kept in the repo
+## Included in this sanitized repo
 
-- `resumes/`
-- `resume_archive/`
-- `match_cache/`
-- `match_cache_archive/`
-- `web_ui/runtime/`
+- real environment files were removed
+- local virtual environments and runtime outputs were removed
+- cached match outputs, resume workspaces, archives, and local databases were removed
+- duplicate legacy SQL files were removed in favor of `supabase_sql/`
+- local JSON data snapshots were removed so the repo stays lightweight and Supabase remains the primary source of truth for jobs and user data
 
 ## Notes
 
-- Keep all real secrets in your host environment variables, not in the repo.
-- The Python app remains available as a reference/local path while `pages_frontend/` is the deployed web frontend.
+- Keep all real secrets in Cloudflare/Supabase environment variables, not in the repo.
+- The Python app is still here as the original local/server implementation.
+- The website path is now the main path for your browser-compute architecture.
