@@ -235,6 +235,10 @@
                     </div>
                     <div class="mt-3 rounded-2xl bg-black/20 p-4 ring-soft">
                       <div id="freeRunStatus" class="text-sm text-slate-300">Browser pipeline idle.</div>
+                      <div class="mt-3 flex items-center justify-between gap-3 text-xs text-slate-400 max-sm:flex-col max-sm:items-start">
+                        <div>Stage: <span id="freeRunStage" class="text-slate-200">Idle</span></div>
+                        <div>Elapsed: <span id="freeRunElapsed" class="text-slate-200">0:00</span></div>
+                      </div>
                       <div class="mt-3 h-2 w-full rounded-full bg-black/30 ring-soft"><div id="freeRunProgressFill" class="h-2 rounded-full bg-gradient-to-r from-indigo-500 to-fuchsia-500" style="width:0%"></div></div>
                     </div>
                     <div id="freeRunMessage" class="mt-3 hidden rounded-2xl px-4 py-3 text-sm"></div>
@@ -273,6 +277,10 @@
                   <button id="premiumRunButton" class="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold hover:bg-indigo-500 lg:col-span-2" type="submit">Run</button>
                   <div class="rounded-2xl bg-black/20 p-4 ring-soft lg:col-span-2">
                     <div id="premiumRunStatus" class="text-sm text-slate-300">Premium pipeline idle.</div>
+                    <div class="mt-3 flex items-center justify-between gap-3 text-xs text-slate-400 max-sm:flex-col max-sm:items-start">
+                      <div>Stage: <span id="premiumRunStage" class="text-slate-200">Idle</span></div>
+                      <div>Elapsed: <span id="premiumRunElapsed" class="text-slate-200">0:00</span></div>
+                    </div>
                     <div class="mt-3 h-2 w-full rounded-full bg-black/30 ring-soft"><div id="premiumRunProgressFill" class="h-2 rounded-full bg-gradient-to-r from-indigo-500 to-fuchsia-500" style="width:0%"></div></div>
                   </div>
                   <div id="premiumRunMessage" class="hidden rounded-2xl px-4 py-3 text-sm lg:col-span-2"></div>

@@ -56,11 +56,15 @@ const dom = {
   freeRunButton: document.getElementById('freeRunButton'),
   freeRunMessage: document.getElementById('freeRunMessage'),
   freeRunStatus: document.getElementById('freeRunStatus'),
+  freeRunStage: document.getElementById('freeRunStage'),
+  freeRunElapsed: document.getElementById('freeRunElapsed'),
   freeRunProgressFill: document.getElementById('freeRunProgressFill'),
   premiumRunForm: document.getElementById('premiumRunForm'),
   premiumRunButton: document.getElementById('premiumRunButton'),
   premiumRunMessage: document.getElementById('premiumRunMessage'),
   premiumRunStatus: document.getElementById('premiumRunStatus'),
+  premiumRunStage: document.getElementById('premiumRunStage'),
+  premiumRunElapsed: document.getElementById('premiumRunElapsed'),
   premiumRunProgressFill: document.getElementById('premiumRunProgressFill'),
   runTabs: Array.from(document.querySelectorAll('.run-tab-btn')),
   runPanels: Array.from(document.querySelectorAll('.run-tab-panel')),
@@ -130,6 +134,84 @@ function updatePipelineUi(statusEl, fillEl, message, progress = null) {
   if (fillEl && progress !== null && Number.isFinite(Number(progress))) {
     fillEl.style.width = `${Math.max(0, Math.min(100, Number(progress)))}%`;
   }
+}
+
+const pipelineUiState = {
+  free: {
+    statusEl: dom.freeRunStatus,
+    stageEl: dom.freeRunStage,
+    elapsedEl: dom.freeRunElapsed,
+    fillEl: dom.freeRunProgressFill,
+    idleMessage: 'Browser pipeline idle.',
+    timerId: null,
+    startedAt: null,
+  },
+  premium: {
+    statusEl: dom.premiumRunStatus,
+    stageEl: dom.premiumRunStage,
+    elapsedEl: dom.premiumRunElapsed,
+    fillEl: dom.premiumRunProgressFill,
+    idleMessage: 'Premium pipeline idle.',
+    timerId: null,
+    startedAt: null,
+  }
+};
+
+function formatElapsed(ms) {
+  const totalSeconds = Math.max(0, Math.floor(Number(ms || 0) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function stopPipelineTimer(kind) {
+  const ui = pipelineUiState[kind];
+  if (!ui) return;
+  if (ui.timerId) {
+    window.clearInterval(ui.timerId);
+    ui.timerId = null;
+  }
+}
+
+function setPipelineElapsed(kind, elapsedMs) {
+  const ui = pipelineUiState[kind];
+  if (!ui?.elapsedEl) return;
+  ui.elapsedEl.textContent = formatElapsed(elapsedMs);
+}
+
+function updatePipelineDisplay(kind, message, progress = null, stage = null) {
+  const ui = pipelineUiState[kind];
+  if (!ui) return;
+  updatePipelineUi(ui.statusEl, ui.fillEl, message, progress);
+  if (ui.stageEl) ui.stageEl.textContent = stage || message || 'Idle';
+  if (ui.startedAt) setPipelineElapsed(kind, Date.now() - ui.startedAt);
+}
+
+function startPipelineDisplay(kind, message, progress = 0) {
+  const ui = pipelineUiState[kind];
+  if (!ui) return;
+  stopPipelineTimer(kind);
+  ui.startedAt = Date.now();
+  setPipelineElapsed(kind, 0);
+  updatePipelineDisplay(kind, message, progress, message);
+  ui.timerId = window.setInterval(() => {
+    if (ui.startedAt) setPipelineElapsed(kind, Date.now() - ui.startedAt);
+  }, 250);
+}
+
+function finishPipelineDisplay(kind, message, progress = 100, stage = 'Complete') {
+  updatePipelineDisplay(kind, message, progress, stage);
+  stopPipelineTimer(kind);
+}
+
+function resetPipelineDisplay(kind) {
+  const ui = pipelineUiState[kind];
+  if (!ui) return;
+  stopPipelineTimer(kind);
+  ui.startedAt = null;
+  updatePipelineUi(ui.statusEl, ui.fillEl, ui.idleMessage, 0);
+  if (ui.stageEl) ui.stageEl.textContent = 'Idle';
+  setPipelineElapsed(kind, 0);
 }
 
 async function getSupabaseClient() {
@@ -763,7 +845,7 @@ function setRunTab(tab) {
 async function handleFreeRun(event) {
   event.preventDefault();
   clearMessage(dom.freeRunMessage);
-  updatePipelineUi(dom.freeRunStatus, dom.freeRunProgressFill, 'Checking browser pipeline…', 4);
+  startPipelineDisplay('free', 'Checking browser pipeline…', 4);
   setBusy(dom.freeRunButton, true, 'Start', 'Running browser pipeline...');
   try {
     if (!window.ResumeBrowserPipeline) throw new Error('Browser pipeline client is missing from the frontend.');
@@ -777,16 +859,16 @@ async function handleFreeRun(event) {
       resumeRow: resume,
       locationMode: dom.locationMode.value,
       selectedCountries,
-      onProgress: ({ message, progress }) => updatePipelineUi(dom.freeRunStatus, dom.freeRunProgressFill, message, progress),
+      onProgress: ({ message, progress }) => updatePipelineDisplay('free', message, progress, message),
     });
 
     await refreshAll();
     showMessage(dom.freeRunMessage, `Saved ${result.results.length} browser-scored matches.`, 'success');
-    updatePipelineUi(dom.freeRunStatus, dom.freeRunProgressFill, 'Browser pipeline finished. Results are ready.', 100);
+    finishPipelineDisplay('free', 'Browser pipeline finished. Results are ready.', 100, 'Complete');
     switchView('results');
   } catch (err) {
     showMessage(dom.freeRunMessage, err.message || 'Free browser pipeline failed.', 'error');
-    updatePipelineUi(dom.freeRunStatus, dom.freeRunProgressFill, err.message || 'Free browser pipeline failed.', 0);
+    finishPipelineDisplay('free', err.message || 'Free browser pipeline failed.', 0, 'Failed');
   } finally {
     setBusy(dom.freeRunButton, false, 'Start', 'Running browser pipeline...');
   }
@@ -795,7 +877,7 @@ async function handleFreeRun(event) {
 async function handlePremiumRun(event) {
   event.preventDefault();
   clearMessage(dom.premiumRunMessage);
-  updatePipelineUi(dom.premiumRunStatus, dom.premiumRunProgressFill, 'Checking premium backend…', 4);
+  startPipelineDisplay('premium', 'Checking premium backend…', 4);
   setBusy(dom.premiumRunButton, true, 'Run', 'Running premium...');
   try {
     if (!window.ResumeBrowserPipeline) throw new Error('Browser pipeline client is missing from the frontend.');
@@ -813,16 +895,16 @@ async function handlePremiumRun(event) {
         workMode: dom.premiumWorkModeInput?.value || '',
         posted: dom.premiumPostedInput?.value || 'all',
       },
-      onProgress: ({ message, progress }) => updatePipelineUi(dom.premiumRunStatus, dom.premiumRunProgressFill, message, progress),
+      onProgress: ({ message, progress }) => updatePipelineDisplay('premium', message, progress, message),
     });
 
     await refreshAll();
     showMessage(dom.premiumRunMessage, `Saved ${Array.isArray(result.results) ? result.results.length : 0} premium matches.`, 'success');
-    updatePipelineUi(dom.premiumRunStatus, dom.premiumRunProgressFill, 'Premium run finished. Saved to the Premium page.', 100);
+    finishPipelineDisplay('premium', 'Premium run finished. Saved to the Premium page.', 100, 'Complete');
     switchView('premium');
   } catch (err) {
     showMessage(dom.premiumRunMessage, err.message || 'Premium run failed.', 'error');
-    updatePipelineUi(dom.premiumRunStatus, dom.premiumRunProgressFill, err.message || 'Premium run failed.', 0);
+    finishPipelineDisplay('premium', err.message || 'Premium run failed.', 0, 'Failed');
   } finally {
     setBusy(dom.premiumRunButton, false, 'Run', 'Running premium...');
   }
@@ -897,6 +979,8 @@ function attachEvents() {
 }
 
 async function boot() {
+  resetPipelineDisplay('free');
+  resetPipelineDisplay('premium');
   initCountryPicker();
   renderSelectedCountries();
   syncCountryMode();
