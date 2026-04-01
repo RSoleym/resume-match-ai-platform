@@ -1,0 +1,5 @@
+[
+  {"type": "workday", "name":"intel","host":"https://intel.wd1.myworkdayjobs.com","site":"External","category":"engineering"},
+  {"type": "workday", "name":"nvidia","host":"https://nvidia.wd5.myworkdayjobs.com","site":"NVIDIAExternalCareerSite","category":"engineering"},
+  {"type": "workday", "name":"netflix","host":"https://netflix.wd1.myworkdayjobs.com","site":"Netflix","category":"engineering"}
+]

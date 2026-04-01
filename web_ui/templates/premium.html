@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% set active = "premium" %}
+{% block content %}
+  <div class="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+    <div>
+      <h1 class="text-2xl font-semibold">Premium</h1>
+      <p class="mt-1 text-sm text-slate-400">Use your scanned resume with the premium matcher. Results are saved in Supabase and ranked with {{ openai_model }}.</p>
+    </div>
+  </div>
+
+  <div class="mt-6 rounded-3xl bg-white/5 p-5 ring-soft">
+    <div class="flex flex-wrap gap-2 text-xs text-slate-300">
+      <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Premium: <b class="text-slate-100">{{ 'Unlocked' if premium_state.premium_access else 'Locked' }}</b></span>
+      <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Searches used: <b class="text-slate-100">{{ premium_state.premium_searches_used }}</b> / {{ PREMIUM_MAX_SEARCHES }}</span>
+      <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Searches remaining: <b class="text-slate-100">{{ premium_state.premium_searches_remaining }}</b></span>
+      <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Admin: <b class="text-slate-100">{{ 'Yes' if premium_state.premium_admin_access else 'No' }}</b></span>
+    </div>
+  </div>
+
+  {% if not premium_state.premium_access %}
+    <div class="mt-6 rounded-3xl bg-white/5 p-5 ring-soft max-w-2xl">
+      <div class="text-sm font-semibold text-slate-100">Unlock premium</div>
+      <div class="mt-1 text-sm text-slate-400">Enter your premium code to enable the premium matcher.</div>
+      <form method="post" action="{{ url_for('premium_unlock_submit') }}" class="mt-4 flex flex-col gap-3 sm:flex-row">
+        <input name="premium_code" type="text" placeholder="Enter premium code" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft" />
+        <button class="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold hover:bg-indigo-500" type="submit">Unlock</button>
+      </form>
+    </div>
+  {% else %}
+    {% if premium_state.premium_locked and not premium_state.premium_admin_access %}
+      <div class="mt-6 rounded-3xl bg-amber-500/10 p-5 ring-soft max-w-2xl">
+        <div class="text-sm font-semibold text-amber-200">Premium search limit reached</div>
+        <div class="mt-1 text-sm text-slate-300">You have used all {{ PREMIUM_MAX_SEARCHES }} premium search{% if PREMIUM_MAX_SEARCHES != 1 %}es{% endif %}. Enter the admin code to keep running premium searches.</div>
+        <form method="post" action="{{ url_for('premium_admin_unlock_submit') }}" class="mt-4 flex flex-col gap-3 sm:flex-row">
+          <input name="admin_code" type="text" placeholder="Enter admin code" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft" />
+          <button class="rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold hover:bg-white/15 ring-soft" type="submit">Unlock admin</button>
+        </form>
+      </div>
+    {% endif %}
+
+    <div class="mt-6 rounded-3xl bg-white/5 p-5 ring-soft">
+      <form method="post" action="{{ url_for('premium_run_submit') }}" class="grid gap-3 lg:grid-cols-[1.15fr_0.9fr_0.9fr_0.8fr_0.8fr_auto]">
+        <div class="rounded-2xl bg-black/20 px-4 py-3 text-sm text-slate-300 ring-soft">Using your uploaded resume automatically.</div>
+
+        <select name="country" id="premiumCountryFilter" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft">
+          <option value="" {% if not country_filter %}selected{% endif %}>All countries</option>
+          {% for c in countries %}
+            <option value="{{ c }}" {% if c == country_filter %}selected{% endif %}>{{ c }}</option>
+          {% endfor %}
+        </select>
+
+        <input name="region" type="text" value="{{ region_filter or '' }}" placeholder="Type city or location" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft" />
+
+        <select name="work_mode" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft">
+          <option value="" {% if not work_mode_filter %}selected{% endif %}>All work modes</option>
+          {% for wm in work_modes %}
+            <option value="{{ wm }}" {% if wm == work_mode_filter %}selected{% endif %}>{{ wm }}</option>
+          {% endfor %}
+        </select>
+
+        <select name="posted_range" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft">
+          <option value="all" {% if posted_filter == 'all' %}selected{% endif %}>All time</option>
+          <option value="month" {% if posted_filter == 'month' %}selected{% endif %}>Past month</option>
+          <option value="week" {% if posted_filter == 'week' %}selected{% endif %}>Past week</option>
+        </select>
+
+        <button class="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold hover:bg-indigo-500 disabled:opacity-50" type="submit" {% if (premium_state.premium_locked and not premium_state.premium_admin_access) or not resume_ids %}disabled{% endif %}>Run</button>
+      </form>
+
+      <div class="mt-3 flex flex-wrap gap-2 text-xs text-slate-400">
+        <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Saved results: <b class="text-slate-100">{{ total_results }}</b></span>
+        <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Showing: <b class="text-slate-100">{{ range_start }}-{{ range_end }}</b></span>
+        <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Sorted by: <b class="text-slate-100">premium match first</b></span>
+      </div>
+
+      {% if total_results > 10 %}
+        <form method="get" action="{{ url_for('premium_page') }}" class="mt-4 grid gap-3 lg:grid-cols-[1.15fr_0.9fr_0.9fr_0.8fr_0.8fr_0.7fr_auto]">
+          <input type="hidden" name="resume_id" value="{{ selected_id or '' }}" />
+          <input type="hidden" name="country" value="{{ country_filter or '' }}" />
+          <input type="hidden" name="region" value="{{ region_filter or '' }}" />
+          <input type="hidden" name="work_mode" value="{{ work_mode_filter or '' }}" />
+          <input type="hidden" name="posted_range" value="{{ posted_filter or 'all' }}" />
+          <div class="rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft lg:col-span-5">Browse the saved premium results without using another search.</div>
+          <select name="page" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft">
+            {% for opt in page_options %}
+              <option value="{{ opt.value }}" {% if opt.value == page %}selected{% endif %}>{{ opt.label }}</option>
+            {% endfor %}
+          </select>
+          <button class="rounded-2xl bg-white/10 px-4 py-3 text-sm font-semibold hover:bg-white/15 ring-soft" type="submit">View</button>
+        </form>
+      {% endif %}
+    </div>
+
+    {% if not resume_ids %}
+      <div class="mt-6 rounded-3xl bg-white/5 p-6 ring-soft">
+        <div class="text-sm text-slate-300">No scanned resume found yet. Upload a resume and run the free pipeline once before using Premium.</div>
+      </div>
+    {% elif not rows or rows|length == 0 %}
+      <div class="mt-6 rounded-3xl bg-white/5 p-6 ring-soft">
+        <div class="text-sm text-slate-300">No premium results saved yet. Pick where you want to search and press <b>Run</b>.</div>
+      </div>
+    {% else %}
+      <div class="mt-6 grid gap-4">
+        {% for r in rows %}
+          {% set pct = r.final_match_percent %}
+          {% set raw = r.raw_match_percent %}
+          <div class="rounded-3xl bg-white/5 p-5 ring-soft">
+            <div class="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <div class="text-lg font-semibold text-slate-100">{{ r.title }}</div>
+                <div class="mt-1 text-sm text-slate-400">{{ r.company }} • {{ r.location }}</div>
+
+                <div class="mt-2 flex flex-wrap gap-2 text-xs">
+                  <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Premium: <b class="text-slate-100">{{ pct }}%</b></span>
+                  <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Raw: <b class="text-slate-100">{{ raw }}%</b></span>
+                  {% if r.country %}
+                    <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Country: <b class="text-slate-100">{{ r.country }}</b></span>
+                  {% endif %}
+                  {% if r.region %}
+                    <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">City: <b class="text-slate-100">{{ r.region }}</b></span>
+                  {% endif %}
+                  <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Work mode: <b class="text-slate-100">{{ r.work_mode }}</b></span>
+                  <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Posted: <b class="text-slate-100">{{ r.posted_date_display }}</b></span>
+                  {% if r.premium_reason %}
+                    <span class="rounded-full bg-indigo-500/15 px-3 py-1 text-indigo-200 ring-soft">{{ r.premium_reason }}</span>
+                  {% endif %}
+                </div>
+              </div>
+
+              <div class="flex items-center gap-2">
+                {% if r.best_url %}
+                  <a href="{{ url_for('open_posting_redirect', job_id=r.job_id, url=r.best_url, title=r.title, company=r.company, location=r.location, next=request.full_path) }}" target="_blank" rel="noopener noreferrer" class="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold hover:bg-white/15 ring-soft">Open posting</a>
+                {% else %}
+                  <span class="rounded-2xl bg-white/5 px-4 py-2 text-sm text-slate-400 ring-soft">No URL</span>
+                {% endif %}
+              </div>
+            </div>
+
+            <div class="mt-4">
+              <div class="h-2 w-full rounded-full bg-black/30 ring-soft">
+                <div class="h-2 rounded-full bg-gradient-to-r from-indigo-500 to-fuchsia-500" style="width: {{ pct }}%"></div>
+              </div>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+  {% endif %}
+{% endblock %}
+
+
+

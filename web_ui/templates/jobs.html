@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% set active = "jobs" %}
+{% block content %}
+  <div class="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+    <div>
+      <h1 class="text-2xl font-semibold">Jobs</h1>
+      <p class="mt-1 text-sm text-slate-400">Browse scraped jobs. Search by title/company/location and filter by country or work mode.</p>
+    </div>
+  </div>
+
+  <div class="mt-6 rounded-3xl bg-white/5 p-5 ring-soft">
+   <form method="get" action="{{ url_for('jobs_page') }}" class="grid gap-3 lg:grid-cols-[1fr_260px_220px_auto]">
+  <input name="q" value="{{ q }}" placeholder="Search…"
+         class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft" />
+
+  <select name="country" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft">
+    <option value="" {% if not country_filter %}selected{% endif %}>All countries</option>
+    {% for c in countries %}
+      <option value="{{ c }}" {% if c == country_filter %}selected{% endif %}>{{ c }}</option>
+    {% endfor %}
+  </select>
+
+  <select name="work_mode" class="w-full rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft">
+    <option value="" {% if not work_mode_filter %}selected{% endif %}>All work modes</option>
+    {% for wm in work_modes %}
+      <option value="{{ wm }}" {% if wm == work_mode_filter %}selected{% endif %}>{{ wm }}</option>
+    {% endfor %}
+  </select>
+
+  <button class="rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold hover:bg-indigo-500" type="submit">Apply</button>
+</form>
+  </div>
+
+  <div class="mt-6 space-y-3">
+    {% for j in jobs %}
+      <div class="rounded-3xl bg-white/5 p-5 ring-soft">
+        <div class="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <div class="text-lg font-semibold">{{ j.title }}</div>
+            <div class="text-sm text-slate-400">{{ j.company }} • {{ j.location }}</div>
+            <div class="mt-2 flex flex-wrap gap-2 text-xs">
+              {% if j.country %}
+                <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Country: <b class="text-slate-100">{{ j.country }}</b></span>
+              {% endif %}
+              <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Work mode: <b class="text-slate-100">{{ j.work_mode }}</b></span>
+              <span class="rounded-full bg-white/10 px-3 py-1 ring-soft">Posted: <b class="text-slate-100">{{ j.posted_date or 'Unknown' }}</b></span>
+            </div>
+            <div class="mt-2 text-xs text-slate-500">job_id: {{ j.job_id }} • collected: {{ j.collected_date }}</div>
+          </div>
+          {% if j.source_url %}
+            <a href="{{ j.source_url }}" target="_blank" class="mt-2 sm:mt-0 rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold hover:bg-white/15 ring-soft">Open</a>
+          {% endif %}
+        </div>
+      </div>
+    {% endfor %}
+  </div>
+{% endblock %}

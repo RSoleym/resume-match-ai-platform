@@ -1,0 +1,8 @@
+.glass { backdrop-filter: blur(10px); background: rgba(15, 23, 42, 0.55); }
+.ring-soft { box-shadow: 0 0 0 1px rgba(148,163,184,0.25) inset; }
+.active-nav { background: rgba(255,255,255,0.05); }
+.view-section.hidden { display: none; }
+.message-success { border: 1px solid rgba(74, 222, 128, 0.22); background: rgba(34, 197, 94, 0.08); color: rgb(187 247 208); }
+.message-error { border: 1px solid rgba(248, 113, 113, 0.22); background: rgba(239, 68, 68, 0.08); color: rgb(254 202 202); }
+.message-info { border: 1px solid rgba(148,163,184,0.22); background: rgba(255,255,255,0.04); color: rgb(226 232 240); }
+.resume-row, .result-card { background: rgba(255,255,255,0.04); }

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% set active = "upload" %}
+{% block content %}
+  <div class="flex items-end justify-between gap-4">
+    <div>
+      <h1 class="text-2xl font-semibold">Upload</h1>
+      <p class="mt-1 text-sm text-slate-400">Upload resume PDFs. You can also upload images — they’ll be converted to PDF automatically. Max 1 resume is allowed for now.</p>
+    </div>
+    <a href="{{ url_for('run_page') }}" class="rounded-2xl bg-white/10 px-4 py-2 text-sm font-semibold hover:bg-white/15 ring-soft">Next: Run Pipeline →</a>
+  </div>
+
+  <div class="mt-6 grid gap-4 lg:grid-cols-2">
+    <div class="rounded-3xl bg-white/5 p-5 ring-soft">
+      <div class="text-sm font-semibold">Upload file</div>
+      <form class="mt-4 space-y-3" action="{{ url_for('upload_resume') }}" method="post" enctype="multipart/form-data">
+        <label class="block">
+          <span class="text-sm text-slate-300">Choose PDF / image</span>
+          <input id="fileInput" class="mt-2 block w-full cursor-pointer rounded-2xl bg-black/20 px-4 py-3 text-sm ring-soft file:mr-4 file:rounded-xl file:border-0 file:bg-indigo-600 file:px-4 file:py-2 file:text-sm file:font-semibold file:text-white hover:file:bg-indigo-500"
+                 type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.tif,.tiff" required>
+        </label>
+
+        <div id="previewBox" class="hidden rounded-2xl bg-black/20 p-3 ring-soft">
+          <div class="text-xs text-slate-400">Preview</div>
+          <img id="imgPreview" class="mt-2 max-h-56 w-auto rounded-xl ring-soft" alt="preview"/>
+          <div id="fileName" class="mt-2 text-sm text-slate-200"></div>
+        </div>
+
+        <button class="w-full rounded-2xl bg-indigo-600 px-4 py-3 text-sm font-semibold hover:bg-indigo-500" type="submit">
+          Upload
+        </button>
+      </form>
+
+      <div class="mt-4 text-xs text-slate-400">
+        Files are saved to your Supabase storage and linked to your account in the database. Limit: <b>{{ max_resumes }}</b> resumes and under <b>1 MB</b> per file.
+      </div>
+    </div>
+
+    <div class="rounded-3xl bg-white/5 p-5 ring-soft">
+      <div class="text-sm font-semibold">Current resumes in your account ({{ resumes|length }}/{{ max_resumes }})</div>
+      {% if resumes and resumes|length > 0 %}
+        <ul class="mt-4 space-y-2">
+          {% for r in resumes %}
+            <li class="flex items-center justify-between rounded-2xl bg-black/20 px-3 py-2 text-sm ring-soft gap-3">
+              <div class="min-w-0">
+                <div class="truncate text-slate-200">{{ r.display_label }}</div>
+                <div class="mt-1 text-xs text-slate-500">{{ r.relative_time }}</div>
+              </div>
+              <div class="flex items-center gap-3 shrink-0">
+                <span class="text-xs text-slate-500">PDF</span>
+                <form action="{{ url_for('delete_resume', stored_filename=r.stored_filename) }}" method="post" onsubmit="return confirm('Archive this resume?');">
+                  <button type="submit" class="rounded-full bg-white/10 px-2.5 py-1 text-xs font-semibold text-slate-200 hover:bg-red-500/80">X</button>
+                </form>
+              </div>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="mt-4 text-sm text-slate-400">No PDFs found yet.</div>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}
