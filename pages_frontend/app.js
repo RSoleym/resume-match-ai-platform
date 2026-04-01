@@ -321,9 +321,13 @@ async function refreshSession() {
   updateSessionUi(data.session || null);
 }
 
-async function fetchCount(table, queryBuilder) {
+async function fetchCount(table, applyFilter) {
   try {
-    const { count, error } = await queryBuilder.select('*', { count: 'exact', head: true });
+    let query = supabaseClient.from(table).select('*', { count: 'exact', head: true });
+    if (typeof applyFilter === 'function') {
+      query = applyFilter(query);
+    }
+    const { count, error } = await query;
     if (error) throw error;
     return count ?? 0;
   } catch {
@@ -414,9 +418,9 @@ async function loadDashboardStats() {
     dom.statMatchRows.textContent = '0';
     return;
   }
-  const matchCount = await fetchCount('match_results', supabaseClient.from('match_results').eq('user_id', activeSession.user.id));
+  const matchCount = await fetchCount('match_results', (query) => query.eq('user_id', activeSession.user.id));
   dom.statMatchRows.textContent = matchCount == null ? '—' : String(matchCount);
-  const jobsCount = await fetchCount('jobs', supabaseClient.from('jobs'));
+  const jobsCount = await fetchCount('jobs');
   dom.statJobsScraped.textContent = jobsCount == null ? '—' : String(jobsCount);
 }
 
