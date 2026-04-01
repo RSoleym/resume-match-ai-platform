@@ -1,4 +1,5 @@
 const CONFIG_ENDPOINT = '/api/public-config';
+const DASHBOARD_STATS_ENDPOINT = '/api/dashboard-stats';
 const MAX_PREMIUM_SEARCHES = 5;
 const COUNTRY_OPTIONS = [
   'Australia', 'Canada', 'China', 'Costa Rica', 'France', 'Germany', 'India', 'Ireland', 'Israel', 'Japan',
@@ -335,6 +336,19 @@ async function fetchCount(table, applyFilter) {
   }
 }
 
+async function fetchServerJobsCount() {
+  try {
+    const res = await fetch(DASHBOARD_STATS_ENDPOINT, { cache: 'no-store' });
+    if (!res.ok) throw new Error('Could not load dashboard stats.');
+    const data = await res.json();
+    const jobsCount = Number(data?.jobsCount);
+    return Number.isFinite(jobsCount) ? jobsCount : null;
+  } catch {
+    return null;
+  }
+}
+
+
 async function loadProfile() {
   profileCache = null;
   if (!activeSession?.user?.id) {
@@ -371,16 +385,23 @@ function renderResumeLists() {
   const hasResumes = resumesCache.length > 0;
   dom.resumeListEmpty.classList.toggle('hidden', hasResumes);
   dom.dashboardResumeEmpty.classList.toggle('hidden', hasResumes);
-  if (!hasResumes) return;
+  if (!hasResumes) {
+    dom.resultsResumeFilter.innerHTML = '<option value="">All resumes</option>';
+    return;
+  }
 
   resumesCache.forEach((resume) => {
+    const deleteId = escapeAttr(resume.id || '');
     const html = `
       <div class="resume-row flex items-center justify-between rounded-2xl px-3 py-2 text-sm ring-soft gap-3">
         <div class="min-w-0">
           <div class="truncate text-slate-200">${escapeHtml(resume.file_name || 'Resume')}</div>
           <div class="mt-1 text-xs text-slate-500">${escapeHtml(fmtRelative(resume.uploaded_at))}</div>
         </div>
-        <span class="text-xs text-slate-500 shrink-0">PDF</span>
+        <div class="flex items-center gap-2 shrink-0">
+          <span class="text-xs text-slate-500">PDF</span>
+          <button type="button" data-delete-resume-id="${deleteId}" class="inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/5 text-slate-300 ring-soft hover:bg-rose-500/15 hover:text-rose-200" aria-label="Delete resume">×</button>
+        </div>
       </div>`;
     dom.resumeList.insertAdjacentHTML('beforeend', html);
     dom.dashboardResumeList.insertAdjacentHTML('beforeend', html);
@@ -391,6 +412,7 @@ function renderResumeLists() {
   );
   dom.resultsResumeFilter.innerHTML = resumeOptions.join('');
 }
+
 
 async function loadResumes() {
   resumesCache = [];
@@ -420,7 +442,7 @@ async function loadDashboardStats() {
   }
   const matchCount = await fetchCount('match_results', (query) => query.eq('user_id', activeSession.user.id));
   dom.statMatchRows.textContent = matchCount == null ? '—' : String(matchCount);
-  const jobsCount = await fetchCount('jobs');
+  const jobsCount = await fetchServerJobsCount();
   dom.statJobsScraped.textContent = jobsCount == null ? '—' : String(jobsCount);
 }
 
@@ -611,7 +633,13 @@ async function handleUpload(event) {
     const file = dom.fileInput.files?.[0];
     if (!file) throw new Error('Choose a file first.');
     if (file.size > 1024 * 1024) throw new Error('File is over 1 MB.');
-    if (resumesCache.length >= 1) throw new Error('Only 1 resume is allowed for now.');
+
+    const { count: existingCount, error: countError } = await supabaseClient
+      .from('resumes')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', activeSession.user.id);
+    if (countError) throw countError;
+    if ((existingCount ?? 0) >= 1) throw new Error('Only 1 resume is allowed for now. Delete the current one first.');
 
     const storagePath = `${activeSession.user.id}/${Date.now()}-${safeFileName(file.name)}`;
     const { error: uploadError } = await supabaseClient.storage.from('resumes').upload(storagePath, file, {
@@ -626,7 +654,10 @@ async function handleUpload(event) {
       storage_path: storagePath,
       parsed_text: null,
     });
-    if (dbError) throw dbError;
+    if (dbError) {
+      await supabaseClient.storage.from('resumes').remove([storagePath]).catch(() => {});
+      throw dbError;
+    }
 
     dom.uploadForm.reset();
     dom.previewBox.classList.add('hidden');
@@ -640,6 +671,50 @@ async function handleUpload(event) {
   } finally {
     setBusy(dom.uploadButton, false, 'Upload', 'Uploading...');
   }
+}
+
+async function deleteResume(resumeId) {
+  if (!activeSession?.user?.id) {
+    showMessage(dom.globalMessage, 'Sign in before deleting a resume.', 'error');
+    return;
+  }
+  const resume = resumesCache.find((item) => item.id === resumeId);
+  if (!resume) {
+    showMessage(dom.globalMessage, 'Resume not found.', 'error');
+    return;
+  }
+  const ok = window.confirm(`Delete ${resume.file_name || 'this resume'}?`);
+  if (!ok) return;
+
+  try {
+    if (resume.storage_path) {
+      const { error: storageError } = await supabaseClient.storage.from('resumes').remove([resume.storage_path]);
+      if (storageError && !/not\s+found/i.test(storageError.message || '')) {
+        throw storageError;
+      }
+    }
+
+    const { error: deleteError } = await supabaseClient
+      .from('resumes')
+      .delete()
+      .eq('id', resume.id)
+      .eq('user_id', activeSession.user.id);
+    if (deleteError) throw deleteError;
+
+    await refreshAll();
+    showMessage(dom.globalMessage, 'Resume deleted.', 'success');
+  } catch (err) {
+    showMessage(dom.globalMessage, err.message || 'Could not delete the resume.', 'error');
+  }
+}
+
+function handleResumeListClick(event) {
+  const button = event.target.closest('[data-delete-resume-id]');
+  if (!button) return;
+  event.preventDefault();
+  const resumeId = button.getAttribute('data-delete-resume-id') || '';
+  if (!resumeId) return;
+  deleteResume(resumeId);
 }
 
 async function handleSignOut() {
@@ -693,6 +768,8 @@ function attachEvents() {
   dom.loginForm?.addEventListener('submit', handleLogin);
   dom.signupForm?.addEventListener('submit', handleSignup);
   dom.uploadForm?.addEventListener('submit', handleUpload);
+  dom.resumeList?.addEventListener('click', handleResumeListClick);
+  dom.dashboardResumeList?.addEventListener('click', handleResumeListClick);
   dom.topSignOutButton?.addEventListener('click', handleSignOut);
   dom.freeRunForm?.addEventListener('submit', handleFreeRun);
   dom.premiumRunForm?.addEventListener('submit', handlePremiumRun);
