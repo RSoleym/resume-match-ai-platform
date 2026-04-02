@@ -1055,8 +1055,17 @@ function extractPostedDateFromText(text) {
 function extractLocationFromText(text) {
   const raw = clean(text, 600);
   if (!raw) return '';
+
+  const lower = raw.toLowerCase();
+  for (const needle of ['location:', 'location -', 'based in:', 'based in -', 'based in ']) {
+    const idx = lower.indexOf(needle);
+    if (idx >= 0) {
+      const value = clean(raw.slice(idx + needle.length).split('\n')[0].split('|')[0], 180);
+      if (value) return value;
+    }
+  }
+
   const patterns = [
-    /(?:location|based in)\s*[:\-]\s*([^|\n]+)/i,
     /\b([A-Z][A-Za-z .'-]+,\s*(?:ON|BC|QC|AB|NS|MB|SK|NB|NL|PE|Canada|United States|USA|United Kingdom|UK))\b/,
     /\b([A-Z][A-Za-z .'-]+,\s*[A-Z][A-Za-z .'-]+)\b/,
   ];
