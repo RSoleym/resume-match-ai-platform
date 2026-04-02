@@ -5,9 +5,11 @@ const DEFAULT_WEB_CHAT_MODEL = 'gpt-4o-search-preview';
 const DEFAULT_SCORING_MODEL = 'gpt-4o-mini';
 const MAX_PREMIUM_SEARCHES = 3;
 const TARGET_RESULTS = 5;
-const MAX_FETCHED_PAGES = 8;
-const MAX_FILTERED_FETCHED_PAGES = 12;
-const MAX_SEARCH_ATTEMPTS = 6;
+const MAX_FETCHED_PAGES = 2;
+const MAX_FILTERED_FETCHED_PAGES = 3;
+const MAX_SEARCH_ATTEMPTS = 4;
+const MAX_SUBREQUESTS_PER_INVOCATION = 40;
+const RESERVED_FINAL_SUBREQUESTS = 4;
 
 const COUNTRY_TO_ISO2 = {
   canada: 'CA',
@@ -137,10 +139,11 @@ export async function onRequestPost(context) {
   }
 
   const startedAt = Date.now();
+  const requestBudget = createRequestBudget(MAX_SUBREQUESTS_PER_INVOCATION);
 
   try {
     const token = readBearer(context.request);
-    const user = await getAuthedUser({ supabaseUrl, anonKey, token });
+    const user = await getAuthedUser({ supabaseUrl, anonKey, token, budget: requestBudget });
     const body = await context.request.json().catch(() => ({}));
     const resumeId = clean(body?.resumeId, 120);
     const resumeContext = normalizeResumeContext(body?.resumeContext || {});
@@ -151,7 +154,7 @@ export async function onRequestPost(context) {
       return json({ error: 'Premium needs parsed resume text first. Run the free/browser pipeline once.' }, 400);
     }
 
-    const profileState = await getProfile({ supabaseUrl, secretKey, userId: user.id });
+    const profileState = await getProfile({ supabaseUrl, secretKey, userId: user.id, budget: requestBudget });
     const premiumUnlocked = !!profileState?.premium_access || !!profileState?.premium_admin_access;
     if (!premiumUnlocked) return json({ error: 'Premium is still locked for this account.' }, 403);
 
@@ -170,6 +173,7 @@ export async function onRequestPost(context) {
       resumeContext,
       filters,
       maxResults: TARGET_RESULTS,
+      budget: requestBudget,
     });
     const liveSearchMs = Date.now() - searchStartedAt;
 
@@ -184,6 +188,7 @@ export async function onRequestPost(context) {
         supabaseUrl,
         secretKey,
         userId: user.id,
+        budget: requestBudget,
         patch: {
           premium_searches_used: searchesUsed + 1,
           premium_last_run_at: new Date().toISOString(),
@@ -198,6 +203,8 @@ export async function onRequestPost(context) {
       timings: {
         total_ms: Date.now() - startedAt,
         live_search_ms: liveSearchMs,
+        subrequests_used: requestBudget.used,
+        subrequests_limit: requestBudget.limit,
       },
       used: isAdmin ? searchesUsed : searchesUsed + 1,
       remaining: isAdmin ? MAX_PREMIUM_SEARCHES : Math.max(0, MAX_PREMIUM_SEARCHES - (searchesUsed + 1)),
@@ -245,99 +252,84 @@ function hasActiveFilters(filters) {
 }
 
 
-async function searchLiveJobsWithOpenAI({ apiKey, webModel, webChatModel, scoringModel, resumeContext, filters, maxResults }) {
+async function searchLiveJobsWithOpenAI({ apiKey, webModel, webChatModel, scoringModel, resumeContext, filters, maxResults, budget }) {
   const target = clamp(Number(maxResults || TARGET_RESULTS), TARGET_RESULTS, 25);
-  const collectTarget = Math.max(12, target * 3);
+  const collectTarget = Math.max(10, target * 2);
   const profile = deriveResumeSearchProfile(resumeContext);
   const attempts = buildBroadeningPlan(filters).slice(0, MAX_SEARCH_ATTEMPTS);
-  const focusBatches = makeFocusTitleBatches(profile);
   const merged = new Map();
   const upstreamErrors = [];
 
   for (const plan of attempts) {
     if (merged.size >= collectTarget) break;
+    if (remainingBudget(budget) <= RESERVED_FINAL_SUBREQUESTS + 1) break;
 
-    for (const focusTitles of focusBatches) {
-      if (merged.size >= collectTarget) break;
+    const attempt = { filters: plan, focusTitles: uniqueKeepOrder(profile.role_titles || [], 6), profile };
+    let candidateRows = [];
 
-      const attempt = { filters: plan, focusTitles, profile };
-      let candidateRows = [];
+    try {
+      candidateRows = await chatSearchForSourceRows({
+        apiKey,
+        webChatModel,
+        webModel,
+        resumeContext,
+        attempt,
+        requestedCount: Math.max(6, Math.min(10, collectTarget - merged.size)),
+        excludeUrls: Array.from(merged.values()).map((row) => row.url).filter(Boolean),
+        budget,
+      });
+    } catch (error) {
+      upstreamErrors.push(cleanError(error));
+    }
 
+    if (!candidateRows.length && merged.size === 0 && remainingBudget(budget) > RESERVED_FINAL_SUBREQUESTS + 1) {
       try {
-        candidateRows = await chatSearchForSourceRows({
-          apiKey,
-          webChatModel,
-          webModel,
-          resumeContext,
-          attempt,
-          requestedCount: Math.max(5, Math.min(8, collectTarget - merged.size)),
-          excludeUrls: Array.from(merged.values()).map((row) => row.url).filter(Boolean),
-        });
+        const structuredHits = await performStructuredSearchAttempt({ apiKey, webModel, attempt, target: Math.max(6, target), budget });
+        if (structuredHits.length) candidateRows = normalizeStructuredSearchRows(structuredHits);
       } catch (error) {
         upstreamErrors.push(cleanError(error));
       }
+    }
 
-      if (!candidateRows.length) {
-        try {
-          const structuredHits = await performStructuredSearchAttempt({ apiKey, webModel, attempt, target: Math.max(6, target) });
-          if (structuredHits.length) {
-            candidateRows = normalizeStructuredSearchRows(structuredHits);
-          }
-        } catch (error) {
-          upstreamErrors.push(cleanError(error));
-        }
-      }
+    if (!candidateRows.length) continue;
 
-      if (!candidateRows.length) {
-        try {
-          const rawHits = await performSearchAttempt({ apiKey, webModel, attempt });
-          if (rawHits.length) {
-            candidateRows = normalizeSearchHits(rawHits, attempt);
-          }
-        } catch (error) {
-          upstreamErrors.push(cleanError(error));
-        }
-      }
-
-      if (!candidateRows.length) continue;
-
-      const enriched = await enrichHitsWithPages(candidateRows, attempt);
-      const filtered = filterAndRankRows(enriched, resumeContext, attempt.filters);
-
-      for (const row of filtered) {
-        const key = String(row.url || row.job_id || '').trim().toLowerCase();
-        if (!key || merged.has(key)) continue;
-        merged.set(key, row);
-        if (merged.size >= collectTarget) break;
-      }
+    const filtered = filterAndRankRows(candidateRows, resumeContext, attempt.filters);
+    for (const row of filtered) {
+      const key = String(row.url || row.job_id || '').trim().toLowerCase();
+      if (!key || merged.has(key)) continue;
+      merged.set(key, row);
+      if (merged.size >= collectTarget) break;
     }
   }
 
-  let rows = Array.from(merged.values()).sort(compareRows).slice(0, Math.max(10, target * 2));
+  let rows = Array.from(merged.values()).sort(compareRows).slice(0, Math.max(8, target * 2));
   if (!rows.length) {
     if (upstreamErrors.length) throw new Error(upstreamErrors[0]);
     return [];
   }
 
-  try {
-    const scored = await scoreJobsWithOpenAI({
-      apiKey,
-      model: scoringModel || DEFAULT_SCORING_MODEL,
-      resumeContext,
-      jobs: rows.slice(0, Math.max(10, target * 2)),
-    });
-    const scoreMap = new Map(scored.map((item) => [String(item.job_id || '').trim(), item]));
-    rows = rows.map((row) => {
-      const hit = scoreMap.get(String(row.job_id || '').trim());
-      if (!hit) return row;
-      return {
-        ...row,
-        match_percentage: clamp(Number(hit.match_percentage || row.match_percentage || 0), 0, 100),
-        reason: clean(hit.reason, 160) || row.reason || 'Found from live web search',
-      };
-    });
-  } catch {
-    // keep heuristic scores
+  if (remainingBudget(budget) > RESERVED_FINAL_SUBREQUESTS) {
+    try {
+      const scored = await scoreJobsWithOpenAI({
+        apiKey,
+        model: scoringModel || DEFAULT_SCORING_MODEL,
+        resumeContext,
+        jobs: rows.slice(0, Math.max(8, target * 2)),
+        budget,
+      });
+      const scoreMap = new Map(scored.map((item) => [String(item.job_id || '').trim(), item]));
+      rows = rows.map((row) => {
+        const hit = scoreMap.get(String(row.job_id || '').trim());
+        if (!hit) return row;
+        return {
+          ...row,
+          match_percentage: clamp(Number(hit.match_percentage || row.match_percentage || 0), 0, 100),
+          reason: clean(hit.reason, 160) || row.reason || 'Found from live web search',
+        };
+      });
+    } catch {
+      // keep heuristic scores if model scoring fails
+    }
   }
 
   return rows
@@ -382,8 +374,9 @@ function buildBroadeningPlan(filters) {
     { ...base, region: '' },
     { ...base, region: '', workMode: '' },
     { ...base, region: '', workMode: '', posted: 'all' },
-    { country: '', region: '', workMode: '', posted: 'all' },
   ];
+  if (!clean(base.country, 120)) plans.push({ country: '', region: '', workMode: '', posted: 'all' });
+
   const out = [];
   const seen = new Set();
   for (const plan of plans) {
@@ -454,16 +447,16 @@ function buildLiveSourcesPrompt({ attempt, resumeContext, requestedCount, exclud
     function_scores: resumeContext.candidate_function_scores || {},
     domain: clean(resumeContext.candidate_domain, 120),
     domain_scores: resumeContext.candidate_domain_scores || {},
-    summary: clean(resumeContext.summary, 1400),
-    skills: clean(resumeContext.skills, 1600),
-    experience: clean(resumeContext.experience, 1800),
-    projects: clean(resumeContext.projects, 1200),
-    education: clean(resumeContext.education, 1000),
-    resume_text_excerpt: clean(resumeContext.resume_text, 2600),
+    summary: clean(resumeContext.summary, 1100),
+    skills: clean(resumeContext.skills, 1200),
+    experience: clean(resumeContext.experience, 1200),
+    projects: clean(resumeContext.projects, 900),
+    education: clean(resumeContext.education, 700),
+    resume_text_excerpt: clean(resumeContext.resume_text, 1800),
   };
   const profile = attempt.profile || deriveResumeSearchProfile(resumeContext);
-  const titles = uniqueKeepOrder([...(attempt.focusTitles || []), ...(profile.role_titles || [])], 6);
-  const keywords = uniqueKeepOrder(profile.keywords || [], 14);
+  const titles = uniqueKeepOrder([...(Array.isArray(attempt.focusTitles) ? attempt.focusTitles : []), ...(profile.role_titles || [])], 6);
+  const keywords = uniqueKeepOrder(profile.keywords || [], 12);
   const avoid = uniqueKeepOrder(profile.negative_terms || [], 10);
   const filters = {
     country: attempt.filters.country || 'any',
@@ -473,17 +466,17 @@ function buildLiveSourcesPrompt({ attempt, resumeContext, requestedCount, exclud
   };
 
   return [
-    `Find up to ${requestedCount} current direct job-posting pages using live web search.`,
-    'Only use the resume-derived role titles and technical signals below.',
-    'Do not return search-result pages, directory pages, category pages, expired jobs, or duplicate URLs.',
+    `Return ONLY valid JSON with a top-level key \"jobs\" that contains up to ${requestedCount} current live job postings.`,
+    'Each job must include exactly these fields: title, company, url, location, country, work_mode, posted_date, snippet.',
+    'Every url must be a real direct job-detail page. Never invent urls. Never return generic search pages, listings pages, or expired jobs.',
     `Resume-derived role titles: ${JSON.stringify(titles)}.`,
     `Strong resume keywords: ${JSON.stringify(keywords)}.`,
     `Avoid unrelated families: ${JSON.stringify(avoid)}.`,
     `User filters: ${JSON.stringify(filters)}.`,
-    `Avoid URLs already seen: ${JSON.stringify((excludeUrls || []).slice(-120))}.`,
+    `Avoid URLs already seen: ${JSON.stringify((excludeUrls || []).slice(-60))}.`,
     `Candidate summary: ${JSON.stringify(resumePayload)}.`,
-    'The URLs must be direct job-detail pages.',
-    'You may answer briefly, but include real job-detail URLs from live web search.',
+    'If a field cannot be verified from the live search result, use an empty string instead of guessing.',
+    'Prefer jobs that clearly match the resume category and technical skills.',
   ].join(' ');
 }
 
@@ -534,24 +527,30 @@ function isGenericCareersUrl(url) {
   return false;
 }
 
-async function sourceRowsToJobs(sources, countryFilter, cityFilter, { searchModel = '', resumeContext = {} } = {}) {
+async function sourceRowsToJobs(sources, countryFilter, cityFilter, { searchModel = '', resumeContext = {}, budget = null, maxFetches = MAX_FETCHED_PAGES } = {}) {
   const rows = [];
   const seen = new Set();
   const profile = deriveResumeSearchProfile(resumeContext);
+  let fetched = 0;
 
   for (const [index, src] of (Array.isArray(sources) ? sources : []).entries()) {
     const url = clean(src?.url, 500);
     if (!url || seen.has(url) || isGenericCareersUrl(url)) continue;
     seen.add(url);
 
+    let meta = {};
+    if (fetched < maxFetches && remainingBudget(budget) > RESERVED_FINAL_SUBREQUESTS + 1 && looksFetchableJobUrl(url)) {
+      fetched += 1;
+      meta = await fetchJobPageMetadata(url, budget).catch(() => ({}));
+    }
+
     const citationTitle = clean(src?.title, 220);
-    const meta = await fetchJobPageMetadata(url).catch(() => ({}));
     const metaTitle = clean(meta?.title, 220);
-    const [splitTitleValue, splitCompanyValue] = splitPageTitle(metaTitle || citationTitle);
-    const title = clean(splitTitleValue || citationTitle || metaTitle, 220);
+    const [splitTitleValue, splitCompanyValue] = splitPageTitle(metaTitle || citationTitle || humanizePath(url));
+    const title = clean(splitTitleValue || citationTitle || metaTitle || humanizePath(url), 220);
     const host = hostFromUrl(url);
     const company = clean(meta?.company || splitCompanyValue || titleCase((host.split('.')[0] || '').replace(/[-_]+/g, ' ')), 180);
-    const descriptionText = clean(meta?.description_text || meta?.page_text || '', 1800);
+    const descriptionText = clean(src?.snippet || meta?.description_text || meta?.page_text || '', 1800);
     const pageText = clean(meta?.page_text || descriptionText, 2400);
 
     if (!title || titleTooGeneric(title, pageText)) continue;
@@ -577,7 +576,7 @@ async function sourceRowsToJobs(sources, countryFilter, cityFilter, { searchMode
       job_category: clean(profile.category, 120),
       description_text: descriptionText,
       page_text: pageText,
-      match_percentage: 0,
+      match_percentage: relevanceToPercent(relevance),
       reason: 'Found from live web search',
       search_model: clean(searchModel, 120),
       relevance_score: Number(relevance || 0),
@@ -588,14 +587,14 @@ async function sourceRowsToJobs(sources, countryFilter, cityFilter, { searchMode
   return rows.sort(compareRows);
 }
 
-async function chatSearchForSourceRows({ apiKey, webChatModel, webModel, resumeContext, attempt, requestedCount, excludeUrls }) {
+async function chatSearchForSourceRows({ apiKey, webChatModel, webModel, resumeContext, attempt, requestedCount, excludeUrls, budget }) {
   const chatModel = pickChatSearchModel(webChatModel, webModel);
   const payload = {
     model: chatModel,
     messages: [
       {
         role: 'developer',
-        content: 'Find direct live job-detail pages only. Use the resume-derived titles and keywords. Ignore generic list pages.',
+        content: 'Find direct live job-detail pages only. Return JSON only. Ignore generic list pages and expired jobs.',
       },
       {
         role: 'user',
@@ -616,9 +615,16 @@ async function chatSearchForSourceRows({ apiKey, webChatModel, webModel, resumeC
     apiKey,
     payload,
     attempts: 3,
+    budget,
   });
 
   const { content, sources } = extractChatContentAndAnnotations(data);
+  const parsedJobs = normalizeStructuredSearchRows(extractJsonArray(content)).map((row) => ({
+    ...row,
+    search_model: row.search_model || chatModel,
+  }));
+  if (parsedJobs.length) return parsedJobs;
+
   const sourceCandidates = [];
   const seen = new Set();
   for (const item of [...sources, ...extractUrlsFromText(content).map((url) => ({ url, title: '' }))]) {
@@ -627,24 +633,19 @@ async function chatSearchForSourceRows({ apiKey, webChatModel, webModel, resumeC
     const key = url.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    sourceCandidates.push({ url, title: clean(item?.title, 220) });
+    sourceCandidates.push({ url, title: clean(item?.title, 220), snippet: clean(item?.snippet, 1200) });
   }
 
-  const rows = await sourceRowsToJobs(sourceCandidates, attempt?.filters?.country || '', attempt?.filters?.region || '', {
+  return sourceRowsToJobs(sourceCandidates, attempt?.filters?.country || '', attempt?.filters?.region || '', {
     searchModel: chatModel,
     resumeContext,
+    budget,
+    maxFetches: hasActiveFilters(attempt?.filters) ? MAX_FILTERED_FETCHED_PAGES : MAX_FETCHED_PAGES,
   });
-  if (rows.length) return rows;
-
-  const jobs = normalizeStructuredSearchRows(extractJsonArray(content)).map((row) => ({
-    ...row,
-    search_model: row.search_model || chatModel,
-  }));
-  return jobs;
 }
 
 
-async function performStructuredSearchAttempt({ apiKey, webModel, attempt, target }) {
+async function performStructuredSearchAttempt({ apiKey, webModel, attempt, target, budget }) {
   const tool = {
     type: 'web_search',
     search_context_size: 'medium',
@@ -703,6 +704,7 @@ async function performStructuredSearchAttempt({ apiKey, webModel, attempt, targe
     apiKey,
     payload,
     attempts: 2,
+    budget,
   });
 
   const parsed = extractJsonObject(extractTextFromResponsesPayload(data));
@@ -776,7 +778,7 @@ function buildStructuredSearchPrompt(attempt, target) {
   ].filter(Boolean).join(' ');
 }
 
-async function performSearchAttempt({ apiKey, webModel, attempt }) {
+async function performSearchAttempt({ apiKey, webModel, attempt, budget = null }) {
   const tool = {
     type: 'web_search',
     search_context_size: 'medium',
@@ -802,6 +804,7 @@ async function performSearchAttempt({ apiKey, webModel, attempt }) {
     apiKey,
     payload,
     attempts: 2,
+    budget,
   });
 
   return collectSearchCandidates(data);
@@ -1009,7 +1012,7 @@ function filterAndRankRows(rows, resumeContext, filters) {
   return output.sort(compareRows).slice(0, 8);
 }
 
-async function scoreJobsWithOpenAI({ apiKey, model, resumeContext, jobs }) {
+async function scoreJobsWithOpenAI({ apiKey, model, resumeContext, jobs, budget = null }) {
   const payload = {
     resume: {
       country: clean(resumeContext.candidate_country, 80),
@@ -1058,6 +1061,7 @@ async function scoreJobsWithOpenAI({ apiKey, model, resumeContext, jobs }) {
       max_completion_tokens: 1200,
     },
     attempts: 2,
+    budget,
   });
 
   const content = String(data?.choices?.[0]?.message?.content || '');
@@ -1206,8 +1210,8 @@ function relevanceToPercent(score) {
   return clamp(Math.round(42 + Number(score || 0) * 5.2), 5, 99);
 }
 
-async function fetchJobPageMetadata(url) {
-  const response = await fetch(url, {
+async function fetchJobPageMetadata(url, budget = null) {
+  const response = await budgetedFetch(budget, url, {
     headers: {
       Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'User-Agent': 'Mozilla/5.0',
@@ -1610,7 +1614,25 @@ function cleanError(error) {
 }
 
 
-async function requestOpenAIJson({ url, apiKey, payload, attempts = 2, timeoutMs = 90000 }) {
+function createRequestBudget(limit = MAX_SUBREQUESTS_PER_INVOCATION) {
+  return { limit: Math.max(1, Number(limit || MAX_SUBREQUESTS_PER_INVOCATION)), used: 0 };
+}
+
+function remainingBudget(budget) {
+  return budget ? Math.max(0, Number(budget.limit || 0) - Number(budget.used || 0)) : Infinity;
+}
+
+async function budgetedFetch(budget, url, init) {
+  if (budget) {
+    if (remainingBudget(budget) < 1) {
+      throw new Error('Premium request hit the Cloudflare subrequest safety limit. Broaden the filters and retry.');
+    }
+    budget.used += 1;
+  }
+  return fetch(url, init);
+}
+
+async function requestOpenAIJson({ url, apiKey, payload, attempts = 2, timeoutMs = 90000, budget = null }) {
   let lastMessage = 'OpenAI request failed.';
   let activePayload = payload;
   let retryableBodySeen = false;
@@ -1620,7 +1642,7 @@ async function requestOpenAIJson({ url, apiKey, payload, attempts = 2, timeoutMs
     const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
     try {
-      const response = await fetch(url, {
+      const response = await budgetedFetch(budget, url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1712,8 +1734,8 @@ function readBearer(request) {
   return match[1].trim();
 }
 
-async function getAuthedUser({ supabaseUrl, anonKey, token }) {
-  const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
+async function getAuthedUser({ supabaseUrl, anonKey, token, budget = null }) {
+  const response = await budgetedFetch(budget, `${supabaseUrl}/auth/v1/user`, {
     headers: {
       apikey: anonKey,
       Authorization: `Bearer ${token}`,
@@ -1723,9 +1745,9 @@ async function getAuthedUser({ supabaseUrl, anonKey, token }) {
   return response.json();
 }
 
-async function getProfile({ supabaseUrl, secretKey, userId }) {
+async function getProfile({ supabaseUrl, secretKey, userId, budget = null }) {
   const url = `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}&select=premium_access,premium_admin_access,premium_searches_used`;
-  const response = await fetch(url, {
+  const response = await budgetedFetch(budget, url, {
     headers: {
       apikey: secretKey,
       Authorization: `Bearer ${secretKey}`,
@@ -1736,8 +1758,8 @@ async function getProfile({ supabaseUrl, secretKey, userId }) {
   return Array.isArray(rows) ? rows[0] || null : null;
 }
 
-async function patchProfile({ supabaseUrl, secretKey, userId, patch }) {
-  const response = await fetch(`${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}`, {
+async function patchProfile({ supabaseUrl, secretKey, userId, patch, budget = null }) {
+  const response = await budgetedFetch(budget, `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(userId)}`, {
     method: 'PATCH',
     headers: {
       'Content-Type': 'application/json',
