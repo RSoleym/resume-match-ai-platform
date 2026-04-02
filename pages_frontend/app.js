@@ -475,8 +475,7 @@ function updatePremiumBadges() {
   dom.premiumUsedBadge.textContent = String(used);
   dom.premiumRemainingBadge.textContent = String(remaining);
   dom.premiumAdminBadge.textContent = admin ? 'Yes' : 'No';
-  const showUnlockCard = !admin && (!unlocked || remaining <= 0);
-  dom.premiumUnlockCard.classList.toggle('hidden', !showUnlockCard);
+  dom.premiumUnlockCard.classList.toggle('hidden', unlocked && (admin || remaining > 0));
 }
 
 function renderResumeLists() {

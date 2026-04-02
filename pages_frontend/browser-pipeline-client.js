@@ -288,7 +288,7 @@
     await saveResumeAnalysis({ supabaseClient, resumeRow, parsedText: analysis.parsedText, profile: analysis.profile });
 
     const token = await getAccessToken(supabaseClient);
-    onProgress?.({ message: 'Sending parsed resume context to the premium web-search backend…', progress: 84 });
+    onProgress?.({ message: 'Sending parsed resume to the premium backend…', progress: 82 });
     const response = await fetch(PREMIUM_RUN_ENDPOINT, {
       method: 'POST',
       headers: {
@@ -312,10 +312,10 @@
       session,
       resumeId: resumeRow.id,
       results: Array.isArray(payload.results) ? payload.results : [],
-      filters,
+      filters: payload.filters || filters,
     });
 
-    onProgress?.({ message: 'Premium web-search results saved.', progress: 100 });
+    onProgress?.({ message: 'Premium results saved.', progress: 100 });
     return payload;
   }
 

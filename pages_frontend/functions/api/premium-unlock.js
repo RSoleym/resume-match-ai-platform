@@ -1,20 +1,16 @@
+const DEFAULT_PREMIUM_ACCESS_CODE = 'Capstone2026';
+const DEFAULT_PREMIUM_ADMIN_CODE = 'JBisADemon%92';
 const MAX_PREMIUM_SEARCHES = 3;
-const DEFAULT_ONE_TIME_PREMIUM_CODE = 'Capstone2026';
-const DEFAULT_ADMIN_PREMIUM_CODE = 'JBisADemon%92';
 
 export async function onRequestPost(context) {
-  const supabaseUrl = readEnv(context.env, ['SUPABASE_URL']);
-  const anonKey = readEnv(context.env, ['SUPABASE_ANON_KEY', 'SUPABASE_PUBLISHABLE_KEY']);
-  const secretKey = readEnv(context.env, ['SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY']);
-  const premiumCode = readEnv(context.env, ['PREMIUM_ACCESS_CODE']) || DEFAULT_ONE_TIME_PREMIUM_CODE;
-  const premiumAdminCode = readEnv(context.env, ['PREMIUM_ADMIN_CODE']) || DEFAULT_ADMIN_PREMIUM_CODE;
+  const supabaseUrl = String(context.env.SUPABASE_URL || '').trim();
+  const anonKey = String(context.env.SUPABASE_ANON_KEY || context.env.SUPABASE_PUBLISHABLE_KEY || '').trim();
+  const secretKey = String(context.env.SUPABASE_SECRET_KEY || context.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const premiumCode = String(context.env.PREMIUM_ACCESS_CODE || DEFAULT_PREMIUM_ACCESS_CODE).trim();
+  const premiumAdminCode = String(context.env.PREMIUM_ADMIN_CODE || DEFAULT_PREMIUM_ADMIN_CODE).trim();
 
-  const missing = [];
-  if (!supabaseUrl) missing.push('SUPABASE_URL');
-  if (!anonKey) missing.push('SUPABASE_ANON_KEY');
-  if (!secretKey) missing.push('SUPABASE_SECRET_KEY');
-  if (missing.length) {
-    return json({ error: `Missing Cloudflare backend config: ${missing.join(', ')}.` }, 500);
+  if (!supabaseUrl || !anonKey || !secretKey) {
+    return json({ error: 'Missing Cloudflare backend config.' }, 500);
   }
 
   try {
@@ -24,9 +20,8 @@ export async function onRequestPost(context) {
     const code = String(body?.code || '').trim();
     if (!code) return json({ error: 'Enter a premium code.' }, 400);
 
-    const now = new Date().toISOString();
     let patch = null;
-
+    const now = new Date().toISOString();
     if (code === premiumAdminCode) {
       patch = {
         premium_access: true,
@@ -36,22 +31,18 @@ export async function onRequestPost(context) {
         premium_granted_at: now,
         premium_admin_granted_at: now,
         premium_searches_used: 0,
-        premium_last_run_at: null,
       };
     } else if (code === premiumCode) {
       patch = {
         premium_access: true,
         premium_admin_access: false,
-        premium_source: 'cloudflare-one-time-code',
+        premium_source: 'cloudflare-code',
         premium_granted_at: now,
         premium_searches_used: 0,
-        premium_last_run_at: null,
       };
     }
 
-    if (!patch) {
-      return json({ error: 'That premium code is not valid.' }, 403);
-    }
+    if (!patch) return json({ error: 'That premium code is not valid.' }, 403);
 
     const response = await fetch(`${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(user.id)}`, {
       method: 'PATCH',
@@ -70,19 +61,15 @@ export async function onRequestPost(context) {
     }
 
     const rows = await response.json().catch(() => []);
-    const row = Array.isArray(rows) ? rows[0] : null;
-    return json({ ok: true, profile: row || patch, max_searches: MAX_PREMIUM_SEARCHES });
+    const row = Array.isArray(rows) ? rows[0] || null : null;
+    return json({
+      ok: true,
+      max_searches: MAX_PREMIUM_SEARCHES,
+      profile: row || patch,
+    });
   } catch (error) {
-    return json({ error: error?.message || 'Unexpected error.' }, 500);
+    return json({ error: String(error?.message || error || 'Unexpected error.').slice(0, 500) }, 500);
   }
-}
-
-function readEnv(env, keys) {
-  for (const key of keys) {
-    const value = String(env?.[key] || '').trim();
-    if (value) return value;
-  }
-  return '';
 }
 
 function readBearer(request) {
@@ -94,10 +81,7 @@ function readBearer(request) {
 
 async function getAuthedUser({ supabaseUrl, anonKey, token }) {
   const response = await fetch(`${supabaseUrl}/auth/v1/user`, {
-    headers: {
-      apikey: anonKey,
-      Authorization: `Bearer ${token}`,
-    },
+    headers: { apikey: anonKey, Authorization: `Bearer ${token}` },
   });
   if (!response.ok) throw new Error('Your session expired. Sign in again.');
   return response.json();
