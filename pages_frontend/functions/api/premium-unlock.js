@@ -1,4 +1,4 @@
-const MAX_PREMIUM_SEARCHES = 5;
+const MAX_PREMIUM_SEARCHES = 3;
 const DEFAULT_ONE_TIME_PREMIUM_CODE = 'Capstone2026';
 const DEFAULT_ADMIN_PREMIUM_CODE = 'JBisADemon%92';
 
@@ -13,7 +13,6 @@ export async function onRequestPost(context) {
   if (!supabaseUrl) missing.push('SUPABASE_URL');
   if (!anonKey) missing.push('SUPABASE_ANON_KEY');
   if (!secretKey) missing.push('SUPABASE_SECRET_KEY');
-
   if (missing.length) {
     return json({ error: `Missing Cloudflare backend config: ${missing.join(', ')}.` }, 500);
   }
@@ -25,8 +24,8 @@ export async function onRequestPost(context) {
     const code = String(body?.code || '').trim();
     if (!code) return json({ error: 'Enter a premium code.' }, 400);
 
-    let patch = null;
     const now = new Date().toISOString();
+    let patch = null;
 
     if (code === premiumAdminCode) {
       patch = {
@@ -37,6 +36,7 @@ export async function onRequestPost(context) {
         premium_granted_at: now,
         premium_admin_granted_at: now,
         premium_searches_used: 0,
+        premium_last_run_at: null,
       };
     } else if (code === premiumCode) {
       patch = {
@@ -44,7 +44,8 @@ export async function onRequestPost(context) {
         premium_admin_access: false,
         premium_source: 'cloudflare-one-time-code',
         premium_granted_at: now,
-        premium_searches_used: Math.max(0, MAX_PREMIUM_SEARCHES - 1),
+        premium_searches_used: 0,
+        premium_last_run_at: null,
       };
     }
 
@@ -52,8 +53,7 @@ export async function onRequestPost(context) {
       return json({ error: 'That premium code is not valid.' }, 403);
     }
 
-    const updateUrl = `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(user.id)}`;
-    const response = await fetch(updateUrl, {
+    const response = await fetch(`${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(user.id)}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -71,7 +71,7 @@ export async function onRequestPost(context) {
 
     const rows = await response.json().catch(() => []);
     const row = Array.isArray(rows) ? rows[0] : null;
-    return json({ ok: true, profile: row || patch });
+    return json({ ok: true, profile: row || patch, max_searches: MAX_PREMIUM_SEARCHES });
   } catch (error) {
     return json({ error: error?.message || 'Unexpected error.' }, 500);
   }

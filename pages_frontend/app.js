@@ -1,6 +1,6 @@
 const CONFIG_ENDPOINT = '/api/public-config';
 const DASHBOARD_STATS_ENDPOINT = '/api/dashboard-stats';
-const MAX_PREMIUM_SEARCHES = 5;
+const MAX_PREMIUM_SEARCHES = 3;
 const COUNTRY_OPTIONS = [
   'Australia', 'Canada', 'China', 'Costa Rica', 'France', 'Germany', 'India', 'Ireland', 'Israel', 'Japan',
   'Korea, Republic of', 'Malaysia', 'Mexico', 'Netherlands', 'Poland', 'Singapore', 'Taiwan', 'USA', 'United Kingdom'
@@ -475,7 +475,8 @@ function updatePremiumBadges() {
   dom.premiumUsedBadge.textContent = String(used);
   dom.premiumRemainingBadge.textContent = String(remaining);
   dom.premiumAdminBadge.textContent = admin ? 'Yes' : 'No';
-  dom.premiumUnlockCard.classList.toggle('hidden', unlocked);
+  const showUnlockCard = !admin && (!unlocked || remaining <= 0);
+  dom.premiumUnlockCard.classList.toggle('hidden', !showUnlockCard);
 }
 
 function renderResumeLists() {
