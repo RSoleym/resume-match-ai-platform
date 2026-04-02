@@ -1047,7 +1047,7 @@ function extractPostedDateFromText(text) {
   if (rel) return parseRelativePostedDate(`${rel[1]} ${rel[2]}`);
   if (raw.includes('today') || raw.includes('just posted')) return parseRelativePostedDate('today');
   if (raw.includes('yesterday')) return parseRelativePostedDate('yesterday');
-  const iso = raw.match(/(20\d{2}-\d{2}-\d{2})/);
+  const iso = raw.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
   if (iso) return iso[1];
   return '';
 }
@@ -1058,8 +1058,8 @@ function extractLocationFromText(text) {
   const patterns = [
     /(?:location|based in)\s*[:\-]\s*([^|•
 ]+)/i,
-    /([A-Z][A-Za-z .'-]+,\s*(?:ON|BC|QC|AB|NS|MB|SK|NB|NL|PE|Canada|United States|USA|United Kingdom|UK))/,
-    /([A-Z][A-Za-z .'-]+,\s*[A-Z][A-Za-z .'-]+)/,
+    /\b([A-Z][A-Za-z .'-]+,\s*(?:ON|BC|QC|AB|NS|MB|SK|NB|NL|PE|Canada|United States|USA|United Kingdom|UK))\b/,
+    /\b([A-Z][A-Za-z .'-]+,\s*[A-Z][A-Za-z .'-]+)\b/,
   ];
   for (const rx of patterns) {
     const match = raw.match(rx);
@@ -1068,6 +1068,7 @@ function extractLocationFromText(text) {
   }
   return '';
 }
+
 
 function inferWorkMode(title, location, text) {
   const low = `${title || ''} ${location || ''} ${text || ''}`.toLowerCase();
