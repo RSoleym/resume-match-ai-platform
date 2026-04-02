@@ -245,22 +245,36 @@ async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resume
   const target = clamp(Number(maxResults || TARGET_RESULTS), 1, TARGET_RESULTS);
   const attempts = buildSearchAttempts(resumeContext, filters).slice(0, MAX_SEARCH_ATTEMPTS);
   const merged = new Map();
+  const upstreamErrors = [];
 
   for (const attempt of attempts) {
     if (merged.size >= Math.max(target, 6)) break;
 
-    let rawHits = [];
+    let candidateRows = [];
+
     try {
-      rawHits = await performSearchAttempt({ apiKey, webModel, attempt });
-    } catch {
-      rawHits = [];
+      const structuredHits = await performStructuredSearchAttempt({ apiKey, webModel, attempt, target });
+      if (structuredHits.length) {
+        candidateRows = normalizeStructuredSearchRows(structuredHits);
+      }
+    } catch (error) {
+      upstreamErrors.push(cleanError(error));
     }
-    if (!rawHits.length) continue;
 
-    const normalizedHits = normalizeSearchHits(rawHits, attempt);
-    if (!normalizedHits.length) continue;
+    if (!candidateRows.length) {
+      try {
+        const rawHits = await performSearchAttempt({ apiKey, webModel, attempt });
+        if (rawHits.length) {
+          candidateRows = normalizeSearchHits(rawHits, attempt);
+        }
+      } catch (error) {
+        upstreamErrors.push(cleanError(error));
+      }
+    }
 
-    const enriched = await enrichHitsWithPages(normalizedHits, attempt);
+    if (!candidateRows.length) continue;
+
+    const enriched = await enrichHitsWithPages(candidateRows, attempt);
     const filtered = filterAndRankRows(enriched, resumeContext, attempt.filters);
 
     for (const row of filtered) {
@@ -272,7 +286,12 @@ async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resume
   }
 
   let rows = Array.from(merged.values()).sort(compareRows).slice(0, Math.max(target, 8));
-  if (!rows.length) return [];
+  if (!rows.length) {
+    if (upstreamErrors.length) {
+      throw new Error(upstreamErrors[0]);
+    }
+    return [];
+  }
 
   try {
     const scored = await scoreJobsWithOpenAI({
@@ -328,6 +347,139 @@ function buildSearchAttempts(resumeContext, filters) {
   return out;
 }
 
+async function performStructuredSearchAttempt({ apiKey, webModel, attempt, target }) {
+  const tool = {
+    type: 'web_search',
+    search_context_size: 'medium',
+    filters: {
+      allowed_domains: allowedDomainsForAttempt(attempt),
+    },
+  };
+  const location = buildResponsesUserLocation(attempt.filters.country, '');
+  if (location) tool.user_location = location;
+
+  const payload = {
+    model: webModel,
+    tools: [tool],
+    tool_choice: 'auto',
+    include: ['web_search_call.action.sources'],
+    instructions: 'You are a resume-to-job matching agent. Use live web search to find real, current job postings. Prefer direct job-detail URLs. Never invent a URL. Return only JSON that matches the schema.',
+    input: buildStructuredSearchPrompt(attempt, target),
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'live_job_search_results',
+        strict: true,
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            jobs: {
+              type: 'array',
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  title: { type: 'string' },
+                  company: { type: 'string' },
+                  url: { type: 'string' },
+                  location: { type: 'string' },
+                  country: { type: 'string' },
+                  work_mode: { type: 'string' },
+                  posted_date: { type: 'string' },
+                  snippet: { type: 'string' }
+                },
+                required: ['title', 'company', 'url', 'location', 'country', 'work_mode', 'posted_date', 'snippet']
+              }
+            }
+          },
+          required: ['jobs']
+        }
+      }
+    },
+    max_output_tokens: 1800,
+    store: false,
+  };
+  if (/^(gpt-5|o3|o4)/i.test(webModel)) payload.reasoning = { effort: 'low' };
+
+  const data = await requestOpenAIJson({
+    url: OPENAI_RESPONSES_URL,
+    apiKey,
+    payload,
+    attempts: 2,
+  });
+
+  const parsed = extractJsonObject(extractTextFromResponsesPayload(data));
+  const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+  return jobs.filter((job) => {
+    const url = clean(job?.url, 500);
+    return /^https?:\/\//i.test(url);
+  }).slice(0, Math.max(target, 8));
+}
+
+function normalizeStructuredSearchRows(jobs) {
+  const rows = [];
+  const seen = new Set();
+
+  for (const item of Array.isArray(jobs) ? jobs : []) {
+    const url = clean(item?.url, 500);
+    if (!/^https?:\/\//i.test(url)) continue;
+    const key = url.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const title = clean(item?.title, 220);
+    if (!title) continue;
+
+    const location = clean(item?.location, 220);
+    const snippet = clean(item?.snippet, 1800);
+    const inferredCountry = normalizeCountryName(clean(item?.country || guessCountryFromText(`${location} ${snippet}`), 120));
+
+    rows.push({
+      job_id: `WEB-${simpleHash(url)}`,
+      title,
+      company: clean(item?.company, 180) || titleCase(clean(hostFromUrl(url).split('.')[0]?.replace(/[-_]+/g, ' '), 180)),
+      url,
+      source_url: url,
+      location,
+      country: inferredCountry,
+      work_mode: canonicalizeWorkMode(item?.work_mode) || inferWorkMode(title, location, snippet) || '',
+      posted_date: parseRelativePostedDate(item?.posted_date) || extractPostedDateFromText(item?.posted_date) || '',
+      description_text: snippet,
+      page_text: snippet,
+      reason: 'Found from live web search',
+      search_model: '',
+      relevance_score: 0,
+      match_percentage: 0,
+      host: hostFromUrl(url),
+    });
+  }
+
+  return rows;
+}
+
+function buildStructuredSearchPrompt(attempt, target) {
+  const { filters, focusTitles, profile } = attempt;
+  const titles = uniqueKeepOrder([...(focusTitles || []), ...(profile.role_titles || [])], 6);
+  const keywords = uniqueKeepOrder(profile.keywords || [], 12);
+  const avoid = uniqueKeepOrder(profile.negative_terms || [], 10);
+
+  return [
+    `Find ${Math.max(target, 8)} current engineering job postings that best match this resume profile.`,
+    `Primary role titles: ${titles.join(', ') || 'best matching engineering roles'}.`,
+    keywords.length ? `Required skill keywords to prioritize: ${keywords.join(', ')}.` : '',
+    avoid.length ? `Avoid unrelated roles and domains: ${avoid.join(', ')}.` : '',
+    `Country filter: ${filters.country || 'any'}.`,
+    `City or region filter: ${filters.region || 'any'}.`,
+    `Work mode filter: ${filters.workMode || 'any'}.`,
+    `Posted date filter: ${filters.posted || 'all'}.`,
+    'Use live web search and prefer direct job-detail pages from ATS systems or major job boards.',
+    'Every result must be a real live posting with a real URL.',
+    'Do not return generic careers pages, search results pages, expired jobs, or duplicate URLs.',
+    'If a field cannot be verified from the source, return an empty string for that field instead of guessing.',
+  ].filter(Boolean).join(' ');
+}
+
 async function performSearchAttempt({ apiKey, webModel, attempt }) {
   const tool = {
     type: 'web_search',
@@ -342,7 +494,7 @@ async function performSearchAttempt({ apiKey, webModel, attempt }) {
   const payload = {
     model: webModel,
     tools: [tool],
-    tool_choice: 'required',
+    tool_choice: 'auto',
     include: ['web_search_call.action.sources', 'web_search_call.results'],
     input: buildSearchPrompt(attempt),
     max_output_tokens: 900,
