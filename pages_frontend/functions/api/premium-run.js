@@ -1,6 +1,7 @@
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
 const OPENAI_CHAT_URL = 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_WEB_MODEL = 'gpt-5';
+const DEFAULT_WEB_CHAT_MODEL = 'gpt-4o-search-preview';
 const DEFAULT_SCORING_MODEL = 'gpt-4o-mini';
 const MAX_PREMIUM_SEARCHES = 3;
 const TARGET_RESULTS = 5;
@@ -128,6 +129,7 @@ export async function onRequestPost(context) {
   const secretKey = String(context.env.SUPABASE_SECRET_KEY || context.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
   const openAiKey = String(context.env.OPENAI_API_KEY || context.env.OPENAI_KEY || '').trim();
   const webModel = String(context.env.OPENAI_WEB_MODEL || DEFAULT_WEB_MODEL).trim();
+  const webChatModel = String(context.env.OPENAI_WEB_CHAT_MODEL || DEFAULT_WEB_CHAT_MODEL).trim();
   const scoringModel = String(context.env.OPENAI_MODEL || DEFAULT_SCORING_MODEL).trim();
 
   if (!supabaseUrl || !anonKey || !secretKey || !openAiKey) {
@@ -163,6 +165,7 @@ export async function onRequestPost(context) {
     const liveRows = await searchLiveJobsWithOpenAI({
       apiKey: openAiKey,
       webModel,
+      webChatModel,
       scoringModel,
       resumeContext,
       filters,
@@ -241,55 +244,78 @@ function hasActiveFilters(filters) {
   return !!(clean(filters?.country, 80) || clean(filters?.region, 80) || clean(filters?.workMode, 40) || (clean(filters?.posted, 40) && clean(filters?.posted, 40) !== 'all'));
 }
 
-async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resumeContext, filters, maxResults }) {
-  const target = clamp(Number(maxResults || TARGET_RESULTS), 1, TARGET_RESULTS);
-  const attempts = buildSearchAttempts(resumeContext, filters).slice(0, MAX_SEARCH_ATTEMPTS);
+
+async function searchLiveJobsWithOpenAI({ apiKey, webModel, webChatModel, scoringModel, resumeContext, filters, maxResults }) {
+  const target = clamp(Number(maxResults || TARGET_RESULTS), TARGET_RESULTS, 25);
+  const collectTarget = Math.max(12, target * 3);
+  const profile = deriveResumeSearchProfile(resumeContext);
+  const attempts = buildBroadeningPlan(filters).slice(0, MAX_SEARCH_ATTEMPTS);
+  const focusBatches = makeFocusTitleBatches(profile);
   const merged = new Map();
   const upstreamErrors = [];
 
-  for (const attempt of attempts) {
-    if (merged.size >= Math.max(target, 6)) break;
+  for (const plan of attempts) {
+    if (merged.size >= collectTarget) break;
 
-    let candidateRows = [];
+    for (const focusTitles of focusBatches) {
+      if (merged.size >= collectTarget) break;
 
-    try {
-      const structuredHits = await performStructuredSearchAttempt({ apiKey, webModel, attempt, target });
-      if (structuredHits.length) {
-        candidateRows = normalizeStructuredSearchRows(structuredHits);
-      }
-    } catch (error) {
-      upstreamErrors.push(cleanError(error));
-    }
+      const attempt = { filters: plan, focusTitles, profile };
+      let candidateRows = [];
 
-    if (!candidateRows.length) {
       try {
-        const rawHits = await performSearchAttempt({ apiKey, webModel, attempt });
-        if (rawHits.length) {
-          candidateRows = normalizeSearchHits(rawHits, attempt);
-        }
+        candidateRows = await chatSearchForSourceRows({
+          apiKey,
+          webChatModel,
+          webModel,
+          resumeContext,
+          attempt,
+          requestedCount: Math.max(5, Math.min(8, collectTarget - merged.size)),
+          excludeUrls: Array.from(merged.values()).map((row) => row.url).filter(Boolean),
+        });
       } catch (error) {
         upstreamErrors.push(cleanError(error));
       }
-    }
 
-    if (!candidateRows.length) continue;
+      if (!candidateRows.length) {
+        try {
+          const structuredHits = await performStructuredSearchAttempt({ apiKey, webModel, attempt, target: Math.max(6, target) });
+          if (structuredHits.length) {
+            candidateRows = normalizeStructuredSearchRows(structuredHits);
+          }
+        } catch (error) {
+          upstreamErrors.push(cleanError(error));
+        }
+      }
 
-    const enriched = await enrichHitsWithPages(candidateRows, attempt);
-    const filtered = filterAndRankRows(enriched, resumeContext, attempt.filters);
+      if (!candidateRows.length) {
+        try {
+          const rawHits = await performSearchAttempt({ apiKey, webModel, attempt });
+          if (rawHits.length) {
+            candidateRows = normalizeSearchHits(rawHits, attempt);
+          }
+        } catch (error) {
+          upstreamErrors.push(cleanError(error));
+        }
+      }
 
-    for (const row of filtered) {
-      const key = String(row.url || row.job_id || '').trim().toLowerCase();
-      if (!key || merged.has(key)) continue;
-      merged.set(key, row);
-      if (merged.size >= Math.max(target, 8)) break;
+      if (!candidateRows.length) continue;
+
+      const enriched = await enrichHitsWithPages(candidateRows, attempt);
+      const filtered = filterAndRankRows(enriched, resumeContext, attempt.filters);
+
+      for (const row of filtered) {
+        const key = String(row.url || row.job_id || '').trim().toLowerCase();
+        if (!key || merged.has(key)) continue;
+        merged.set(key, row);
+        if (merged.size >= collectTarget) break;
+      }
     }
   }
 
-  let rows = Array.from(merged.values()).sort(compareRows).slice(0, Math.max(target, 8));
+  let rows = Array.from(merged.values()).sort(compareRows).slice(0, Math.max(10, target * 2));
   if (!rows.length) {
-    if (upstreamErrors.length) {
-      throw new Error(upstreamErrors[0]);
-    }
+    if (upstreamErrors.length) throw new Error(upstreamErrors[0]);
     return [];
   }
 
@@ -298,7 +324,7 @@ async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resume
       apiKey,
       model: scoringModel || DEFAULT_SCORING_MODEL,
       resumeContext,
-      jobs: rows.slice(0, Math.max(target, 6)),
+      jobs: rows.slice(0, Math.max(10, target * 2)),
     });
     const scoreMap = new Map(scored.map((item) => [String(item.job_id || '').trim(), item]));
     rows = rows.map((row) => {
@@ -316,8 +342,9 @@ async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resume
 
   return rows
     .sort((a, b) => (Number(b.match_percentage || 0) - Number(a.match_percentage || 0)) || compareRows(a, b))
-    .slice(0, target);
+    .slice(0, TARGET_RESULTS);
 }
+
 
 function buildSearchAttempts(resumeContext, filters) {
   const profile = deriveResumeSearchProfile(resumeContext);
@@ -346,6 +373,276 @@ function buildSearchAttempts(resumeContext, filters) {
   }
   return out;
 }
+
+
+function buildBroadeningPlan(filters) {
+  const base = filters && typeof filters === 'object' ? filters : {};
+  const plans = [
+    { ...base },
+    { ...base, region: '' },
+    { ...base, region: '', workMode: '' },
+    { ...base, region: '', workMode: '', posted: 'all' },
+    { country: '', region: '', workMode: '', posted: 'all' },
+  ];
+  const out = [];
+  const seen = new Set();
+  for (const plan of plans) {
+    const normalized = {
+      country: normalizeCountryName(clean(plan.country, 120)),
+      region: clean(plan.region, 120),
+      workMode: canonicalizeWorkMode(clean(plan.workMode, 40)),
+      posted: canonicalizePostedRange(clean(plan.posted, 40) || 'all'),
+    };
+    const key = JSON.stringify(normalized);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(normalized);
+  }
+  return out;
+}
+
+function makeFocusTitleBatches(profile) {
+  const titles = Array.isArray(profile?.role_titles) ? profile.role_titles.filter(Boolean) : [];
+  if (!titles.length) return [[]];
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < titles.length && out.length < 5; i += 2) {
+    const batch = titles.slice(i, i + 2).filter(Boolean);
+    const key = JSON.stringify(batch);
+    if (!seen.has(key) && batch.length) {
+      seen.add(key);
+      out.push(batch);
+    }
+  }
+  const firstOnly = titles[0] ? [titles[0]] : [];
+  if (firstOnly.length) {
+    const key = JSON.stringify(firstOnly);
+    if (!seen.has(key) && out.length < 5) out.push(firstOnly);
+  }
+  return out.length ? out : [[]];
+}
+
+function pickChatSearchModel(webChatModel, webModel) {
+  const requested = clean(webChatModel || webModel, 120);
+  if (['gpt-4o-search-preview', 'gpt-4o-mini-search-preview', 'gpt-5-search-api'].includes(requested)) return requested;
+  return DEFAULT_WEB_CHAT_MODEL;
+}
+
+function buildChatUserLocation(country, region) {
+  const countryCode = toIso2(country);
+  const city = clean(region, 80);
+  if (!countryCode && !city) return null;
+  return {
+    type: 'approximate',
+    approximate: {
+      country: countryCode || 'US',
+      city: city || undefined,
+      region: city || undefined,
+    },
+  };
+}
+
+function buildLiveSourcesPrompt({ attempt, resumeContext, requestedCount, excludeUrls }) {
+  const resumePayload = {
+    country: clean(resumeContext.candidate_country, 120),
+    experience_years: resumeContext.candidate_experience_years,
+    degree_level: clean(resumeContext.candidate_degree_level, 80),
+    degree_family: clean(resumeContext.candidate_degree_family, 120),
+    degree_fields: Array.isArray(resumeContext.candidate_degree_fields) ? resumeContext.candidate_degree_fields.slice(0, 10) : [],
+    category: clean(resumeContext.candidate_category || resumeContext.candidate_category_key, 120),
+    function: clean(resumeContext.candidate_function, 120),
+    function_scores: resumeContext.candidate_function_scores || {},
+    domain: clean(resumeContext.candidate_domain, 120),
+    domain_scores: resumeContext.candidate_domain_scores || {},
+    summary: clean(resumeContext.summary, 1400),
+    skills: clean(resumeContext.skills, 1600),
+    experience: clean(resumeContext.experience, 1800),
+    projects: clean(resumeContext.projects, 1200),
+    education: clean(resumeContext.education, 1000),
+    resume_text_excerpt: clean(resumeContext.resume_text, 2600),
+  };
+  const profile = attempt.profile || deriveResumeSearchProfile(resumeContext);
+  const titles = uniqueKeepOrder([...(attempt.focusTitles || []), ...(profile.role_titles || [])], 6);
+  const keywords = uniqueKeepOrder(profile.keywords || [], 14);
+  const avoid = uniqueKeepOrder(profile.negative_terms || [], 10);
+  const filters = {
+    country: attempt.filters.country || 'any',
+    city: attempt.filters.region || 'any',
+    work_mode: attempt.filters.workMode || 'any',
+    posted_range: attempt.filters.posted || 'all',
+  };
+
+  return [
+    `Find up to ${requestedCount} current direct job-posting pages using live web search.`,
+    'Only use the resume-derived role titles and technical signals below.',
+    'Do not return search-result pages, directory pages, category pages, expired jobs, or duplicate URLs.',
+    `Resume-derived role titles: ${JSON.stringify(titles)}.`,
+    `Strong resume keywords: ${JSON.stringify(keywords)}.`,
+    `Avoid unrelated families: ${JSON.stringify(avoid)}.`,
+    `User filters: ${JSON.stringify(filters)}.`,
+    `Avoid URLs already seen: ${JSON.stringify((excludeUrls || []).slice(-120))}.`,
+    `Candidate summary: ${JSON.stringify(resumePayload)}.`,
+    'The URLs must be direct job-detail pages.',
+    'You may answer briefly, but include real job-detail URLs from live web search.',
+  ].join(' ');
+}
+
+function extractChatContentAndAnnotations(data) {
+  const choices = Array.isArray(data?.choices) ? data.choices : [];
+  const msg = choices[0] && typeof choices[0] === 'object' ? choices[0].message : null;
+  let content = '';
+  const sources = [];
+
+  if (typeof msg?.content === 'string') {
+    content = msg.content;
+  } else if (Array.isArray(msg?.content)) {
+    content = msg.content.map((part) => {
+      if (typeof part === 'string') return part;
+      if (part && typeof part === 'object') return String(part.text || '');
+      return '';
+    }).join('\n').trim();
+  }
+
+  if (Array.isArray(msg?.annotations)) {
+    for (const item of msg.annotations) {
+      if (!item || typeof item !== 'object') continue;
+      const citation = item.url_citation && typeof item.url_citation === 'object' ? item.url_citation : item;
+      const url = clean(citation.url, 500);
+      if (!url) continue;
+      sources.push({ url, title: clean(citation.title, 220) });
+    }
+  }
+
+  return { content, sources };
+}
+
+function isGenericCareersUrl(url) {
+  const low = String(url || '').toLowerCase().trim();
+  if (!low) return true;
+  const badPatterns = ['/careers/', '/jobs/', '/job-search', '/search-jobs'];
+  const goodPatterns = ['/job/', 'jobid=', 'job_id=', 'gh_jid=', 'requisition', 'req=', 'reqid=', '/positions/', '/jobs/view/', '/vacancy/', '/posting/', '/opportunity/'];
+  if (goodPatterns.some((x) => low.includes(x))) return false;
+  if (badPatterns.some((x) => low.includes(x))) {
+    try {
+      const parsed = new URL(low);
+      const path = parsed.pathname.replace(/\/+$/, '');
+      if (path.endsWith('/careers') || path.endsWith('/jobs') || path.includes('search')) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function sourceRowsToJobs(sources, countryFilter, cityFilter, { searchModel = '', resumeContext = {} } = {}) {
+  const rows = [];
+  const seen = new Set();
+  const profile = deriveResumeSearchProfile(resumeContext);
+
+  for (const [index, src] of (Array.isArray(sources) ? sources : []).entries()) {
+    const url = clean(src?.url, 500);
+    if (!url || seen.has(url) || isGenericCareersUrl(url)) continue;
+    seen.add(url);
+
+    const citationTitle = clean(src?.title, 220);
+    const meta = await fetchJobPageMetadata(url).catch(() => ({}));
+    const metaTitle = clean(meta?.title, 220);
+    const [splitTitleValue, splitCompanyValue] = splitPageTitle(metaTitle || citationTitle);
+    const title = clean(splitTitleValue || citationTitle || metaTitle, 220);
+    const host = hostFromUrl(url);
+    const company = clean(meta?.company || splitCompanyValue || titleCase((host.split('.')[0] || '').replace(/[-_]+/g, ' ')), 180);
+    const descriptionText = clean(meta?.description_text || meta?.page_text || '', 1800);
+    const pageText = clean(meta?.page_text || descriptionText, 2400);
+
+    if (!title || titleTooGeneric(title, pageText)) continue;
+
+    const relevance = jobRelevanceScore(profile, { title, descriptionText, pageText });
+    if (profile.category && relevance < 2.8) continue;
+
+    const location = clean(meta?.location || extractLocationFromText(`${descriptionText} ${pageText}`), 200);
+    const country = normalizeCountryName(clean(meta?.country || guessCountryFromText(`${location} ${pageText.slice(0, 320)}`), 120));
+
+    rows.push({
+      job_id: `WEB-${String(index + 1).padStart(5, '0')}-${simpleHash(url)}`,
+      title,
+      company,
+      url,
+      source_url: url,
+      location,
+      country,
+      work_mode: canonicalizeWorkMode(meta?.work_mode) || inferWorkMode(title, location, `${descriptionText} ${pageText}`),
+      posted_date: clean(meta?.posted_date || extractPostedDateFromText(`${descriptionText} ${pageText}`), 80),
+      job_function: clean(profile.function, 120),
+      job_domain: clean(profile.domain, 120),
+      job_category: clean(profile.category, 120),
+      description_text: descriptionText,
+      page_text: pageText,
+      match_percentage: 0,
+      reason: 'Found from live web search',
+      search_model: clean(searchModel, 120),
+      relevance_score: Number(relevance || 0),
+      host,
+    });
+  }
+
+  return rows.sort(compareRows);
+}
+
+async function chatSearchForSourceRows({ apiKey, webChatModel, webModel, resumeContext, attempt, requestedCount, excludeUrls }) {
+  const chatModel = pickChatSearchModel(webChatModel, webModel);
+  const payload = {
+    model: chatModel,
+    messages: [
+      {
+        role: 'developer',
+        content: 'Find direct live job-detail pages only. Use the resume-derived titles and keywords. Ignore generic list pages.',
+      },
+      {
+        role: 'user',
+        content: buildLiveSourcesPrompt({ attempt, resumeContext, requestedCount, excludeUrls }),
+      },
+    ],
+    web_search_options: {
+      search_context_size: 'low',
+    },
+    max_completion_tokens: 1400,
+  };
+
+  const userLocation = buildChatUserLocation(attempt?.filters?.country, attempt?.filters?.region);
+  if (userLocation) payload.web_search_options.user_location = userLocation;
+
+  const data = await requestOpenAIJson({
+    url: OPENAI_CHAT_URL,
+    apiKey,
+    payload,
+    attempts: 3,
+  });
+
+  const { content, sources } = extractChatContentAndAnnotations(data);
+  const sourceCandidates = [];
+  const seen = new Set();
+  for (const item of [...sources, ...extractUrlsFromText(content).map((url) => ({ url, title: '' }))]) {
+    const url = clean(item?.url, 500);
+    if (!url) continue;
+    const key = url.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    sourceCandidates.push({ url, title: clean(item?.title, 220) });
+  }
+
+  const rows = await sourceRowsToJobs(sourceCandidates, attempt?.filters?.country || '', attempt?.filters?.region || '', {
+    searchModel: chatModel,
+    resumeContext,
+  });
+  if (rows.length) return rows;
+
+  const jobs = normalizeStructuredSearchRows(extractJsonArray(content)).map((row) => ({
+    ...row,
+    search_model: row.search_model || chatModel,
+  }));
+  return jobs;
+}
+
 
 async function performStructuredSearchAttempt({ apiKey, webModel, attempt, target }) {
   const tool = {
@@ -636,7 +933,8 @@ async function enrichHitsWithPages(rows, attempt) {
   const fetchLimit = hasActiveFilters(attempt?.filters) ? MAX_FILTERED_FETCHED_PAGES : MAX_FETCHED_PAGES;
   for (const row of rows) {
     let enriched = { ...row };
-    const shouldFetch = fetched < fetchLimit && looksFetchableJobUrl(row.url);
+    const hasUsablePageData = clean(row.page_text, 240).length > 120 && (clean(row.location, 120) || clean(row.country, 80));
+    const shouldFetch = fetched < fetchLimit && looksFetchableJobUrl(row.url) && !hasUsablePageData;
     if (shouldFetch) {
       fetched += 1;
       const meta = await fetchJobPageMetadata(row.url).catch(() => ({}));
@@ -1311,46 +1609,80 @@ function cleanError(error) {
   return clean(error.message || error.error || 'Unexpected premium backend error.', 800);
 }
 
-async function requestOpenAIJson({ url, apiKey, payload, attempts = 2 }) {
+
+async function requestOpenAIJson({ url, apiKey, payload, attempts = 2, timeoutMs = 90000 }) {
   let lastMessage = 'OpenAI request failed.';
   let activePayload = payload;
+  let retryableBodySeen = false;
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(activePayload),
-    });
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
 
-    if (response.ok) return response.json();
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(activePayload),
+        signal: controller ? controller.signal : undefined,
+      });
 
-    const text = await response.text().catch(() => '');
-    lastMessage = text || `OpenAI request failed (${response.status}).`;
+      if (timer) clearTimeout(timer);
 
-    if (response.status === 400 && activePayload && typeof activePayload === 'object') {
-      if (shouldRetryWithoutInclude(lastMessage) && 'include' in activePayload) {
-        const { include, ...rest } = activePayload;
-        activePayload = rest;
-        if (attempt < attempts) continue;
+      if (response.ok) return response.json();
+
+      const text = await response.text().catch(() => '');
+      lastMessage = text || `OpenAI request failed (${response.status}).`;
+
+      if (response.status === 400 && activePayload && typeof activePayload === 'object') {
+        if (shouldRetryWithoutInclude(lastMessage) && 'include' in activePayload) {
+          const { include, ...rest } = activePayload;
+          activePayload = rest;
+          if (attempt < attempts) continue;
+        }
+        if (shouldRetryWithoutTemperature(lastMessage) && 'temperature' in activePayload) {
+          const { temperature, ...rest } = activePayload;
+          activePayload = rest;
+          if (attempt < attempts) continue;
+        }
       }
-      if (shouldRetryWithoutTemperature(lastMessage) && 'temperature' in activePayload) {
-        const { temperature, ...rest } = activePayload;
-        activePayload = rest;
-        if (attempt < attempts) continue;
-      }
-    }
 
-    if (response.status === 429 && attempt < attempts) {
-      await sleep(1200 * attempt);
-      continue;
+      const lower = String(lastMessage || '').toLowerCase();
+      const retryable = response.status === 429
+        || response.status >= 500
+        || lower.includes('"type":"server_error"')
+        || lower.includes('"type": "server_error"')
+        || lower.includes('temporarily unavailable');
+
+      if (retryable && attempt < attempts) {
+        retryableBodySeen = retryableBodySeen || lower.includes('server_error');
+        await sleep(Math.min(4000, 900 * attempt + (retryableBodySeen ? 700 : 0)));
+        continue;
+      }
+
+      const requestError = new Error(lastMessage);
+      requestError.__openai_final = true;
+      throw requestError;
+    } catch (error) {
+      if (timer) clearTimeout(timer);
+      if (error && error.__openai_final) throw error;
+      const message = cleanError(error);
+      const retryableNetwork = /aborted|timeout|network|fetch failed|connection/i.test(message);
+      if (retryableNetwork && attempt < attempts) {
+        lastMessage = message || lastMessage;
+        await sleep(Math.min(4000, 900 * attempt));
+        continue;
+      }
+      throw new Error(message || lastMessage);
     }
-    throw new Error(lastMessage);
   }
+
   throw new Error(lastMessage);
 }
+
 
 function shouldRetryWithoutInclude(message) {
   const low = String(message || '').toLowerCase();
