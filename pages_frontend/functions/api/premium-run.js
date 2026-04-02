@@ -1,14 +1,12 @@
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
 const OPENAI_CHAT_URL = 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_WEB_MODEL = 'gpt-5';
-const DEFAULT_SEARCH_CHAT_MODEL = 'gpt-4o-search-preview';
-const DEFAULT_SEARCH_CHAT_MODEL_FALLBACK = 'gpt-4o-mini-search-preview';
 const DEFAULT_SCORING_MODEL = 'gpt-4o-mini';
 const MAX_PREMIUM_SEARCHES = 3;
 const TARGET_RESULTS = 5;
 const MAX_FETCHED_PAGES = 8;
 const MAX_FILTERED_FETCHED_PAGES = 12;
-const MAX_SEARCH_ATTEMPTS = 12;
+const MAX_SEARCH_ATTEMPTS = 6;
 
 const COUNTRY_TO_ISO2 = {
   canada: 'CA',
@@ -130,7 +128,6 @@ export async function onRequestPost(context) {
   const secretKey = String(context.env.SUPABASE_SECRET_KEY || context.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
   const openAiKey = String(context.env.OPENAI_API_KEY || context.env.OPENAI_KEY || '').trim();
   const webModel = String(context.env.OPENAI_WEB_MODEL || DEFAULT_WEB_MODEL).trim();
-  const searchChatModel = String(context.env.OPENAI_WEB_CHAT_MODEL || context.env.OPENAI_SEARCH_MODEL || DEFAULT_SEARCH_CHAT_MODEL).trim();
   const scoringModel = String(context.env.OPENAI_MODEL || DEFAULT_SCORING_MODEL).trim();
 
   if (!supabaseUrl || !anonKey || !secretKey || !openAiKey) {
@@ -166,7 +163,6 @@ export async function onRequestPost(context) {
     const liveRows = await searchLiveJobsWithOpenAI({
       apiKey: openAiKey,
       webModel,
-      searchChatModel,
       scoringModel,
       resumeContext,
       filters,
@@ -245,7 +241,7 @@ function hasActiveFilters(filters) {
   return !!(clean(filters?.country, 80) || clean(filters?.region, 80) || clean(filters?.workMode, 40) || (clean(filters?.posted, 40) && clean(filters?.posted, 40) !== 'all'));
 }
 
-async function searchLiveJobsWithOpenAI({ apiKey, webModel, searchChatModel, scoringModel, resumeContext, filters, maxResults }) {
+async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resumeContext, filters, maxResults }) {
   const target = clamp(Number(maxResults || TARGET_RESULTS), 1, TARGET_RESULTS);
   const attempts = buildSearchAttempts(resumeContext, filters).slice(0, MAX_SEARCH_ATTEMPTS);
   const merged = new Map();
@@ -257,28 +253,12 @@ async function searchLiveJobsWithOpenAI({ apiKey, webModel, searchChatModel, sco
     let candidateRows = [];
 
     try {
-      const chatHits = await performChatSearchAttempt({
-        apiKey,
-        searchChatModel,
-        attempt,
-        target,
-      });
-      if (chatHits.length) {
-        candidateRows = normalizeStructuredSearchRows(chatHits);
+      const structuredHits = await performStructuredSearchAttempt({ apiKey, webModel, attempt, target });
+      if (structuredHits.length) {
+        candidateRows = normalizeStructuredSearchRows(structuredHits);
       }
     } catch (error) {
       upstreamErrors.push(cleanError(error));
-    }
-
-    if (!candidateRows.length) {
-      try {
-        const structuredHits = await performStructuredSearchAttempt({ apiKey, webModel, attempt, target });
-        if (structuredHits.length) {
-          candidateRows = normalizeStructuredSearchRows(structuredHits);
-        }
-      } catch (error) {
-        upstreamErrors.push(cleanError(error));
-      }
     }
 
     if (!candidateRows.length) {
@@ -350,11 +330,8 @@ function buildSearchAttempts(resumeContext, filters) {
 
   const plans = [
     { ...filters },
-    { ...filters, posted: 'all' },
     { ...filters, region: '' },
     { ...filters, region: '', posted: 'all' },
-    { ...filters, region: '', workMode: '', posted: 'all' },
-    { ...filters, country: '', region: '', workMode: '', posted: 'all' },
   ];
 
   const out = [];
@@ -449,20 +426,24 @@ function normalizeStructuredSearchRows(jobs) {
     const key = url.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
-    const title = clean(item?.title || item?.job_title || '', 220);
-    const company = clean(item?.company || '', 180);
-    const location = clean(item?.location || '', 180);
-    const snippet = clean(item?.snippet || item?.description_text || item?.description || '', 1600);
+
+    const title = clean(item?.title, 220);
+    if (!title) continue;
+
+    const location = clean(item?.location, 220);
+    const snippet = clean(item?.snippet, 1800);
+    const inferredCountry = normalizeCountryName(clean(item?.country || guessCountryFromText(`${location} ${snippet}`), 120));
+
     rows.push({
       job_id: `WEB-${simpleHash(url)}`,
-      title: title || humanizePath(url) || 'Job posting',
-      company: company || titleCase(clean(hostFromUrl(url).split('.')[0]?.replace(/[-_]+/g, ' '), 180)),
+      title,
+      company: clean(item?.company, 180) || titleCase(clean(hostFromUrl(url).split('.')[0]?.replace(/[-_]+/g, ' '), 180)),
       url,
       source_url: url,
       location,
-      country: normalizeCountryName(clean(item?.country || guessCountryFromText(`${location} ${snippet}`), 120)),
-      work_mode: canonicalizeWorkMode(item?.work_mode || item?.workMode || inferWorkMode(title, location, snippet)),
-      posted_date: clean(item?.posted_date || item?.postedDate, 80),
+      country: inferredCountry,
+      work_mode: canonicalizeWorkMode(item?.work_mode) || inferWorkMode(title, location, snippet) || '',
+      posted_date: parseRelativePostedDate(item?.posted_date) || extractPostedDateFromText(item?.posted_date) || '',
       description_text: snippet,
       page_text: snippet,
       reason: 'Found from live web search',
@@ -476,185 +457,7 @@ function normalizeStructuredSearchRows(jobs) {
   return rows;
 }
 
-async function performChatSearchAttempt({ apiKey, searchChatModel, attempt, target }) {
-  const models = uniqueKeepOrder([
-    clean(searchChatModel, 120),
-    DEFAULT_SEARCH_CHAT_MODEL,
-    DEFAULT_SEARCH_CHAT_MODEL_FALLBACK,
-  ], 3);
-  let lastError = '';
-
-  for (const model of models) {
-    if (!model) continue;
-    try {
-      const payload = {
-        model,
-        messages: [
-          {
-            role: 'system',
-            content: 'You find current direct job-detail pages that match a resume profile. Use live web search. Never invent a URL. Return only JSON with a top-level jobs array. Avoid generic careers pages, expired jobs, and duplicate URLs.',
-          },
-          {
-            role: 'user',
-            content: buildChatSearchPrompt(attempt, target),
-          },
-        ],
-        web_search_options: buildChatWebSearchOptions(attempt.filters.country, attempt.filters.region, hasActiveFilters(attempt.filters) ? 'medium' : 'low'),
-        max_completion_tokens: 1400,
-        temperature: 0.2,
-      };
-
-      const data = await requestOpenAIJson({
-        url: OPENAI_CHAT_URL,
-        apiKey,
-        payload,
-        attempts: 3,
-      });
-
-      const { text, sources } = extractChatTextAndSources(data);
-      const parsed = extractJsonObject(text);
-      const jobs = Array.isArray(parsed?.jobs)
-        ? parsed.jobs.filter((job) => /^https?:\/\//i.test(clean(job?.url, 500)))
-        : extractJsonArray(text).filter((job) => /^https?:\/\//i.test(clean(job?.url || job?.link, 500))).map((job) => ({
-            ...job,
-            url: clean(job?.url || job?.link, 500),
-          }));
-
-      if (jobs.length) return jobs.slice(0, Math.max(target, 8));
-      if (sources.length) {
-        return sources.map((source) => ({
-          title: clean(source.title, 220),
-          company: '',
-          url: clean(source.url, 500),
-          location: '',
-          country: '',
-          work_mode: '',
-          posted_date: '',
-          snippet: '',
-        })).filter((job) => /^https?:\/\//i.test(job.url)).slice(0, Math.max(target, 8));
-      }
-    } catch (error) {
-      lastError = cleanError(error);
-      if (shouldStopTryingSearchModel(lastError)) break;
-    }
-  }
-
-  if (lastError) throw new Error(lastError);
-  return [];
-}
-
-function buildChatSearchPrompt(attempt, target) {
-  const { filters, focusTitles, profile } = attempt;
-  const titles = uniqueKeepOrder([...(focusTitles || []), ...(profile.role_titles || [])], 6);
-  const keywords = uniqueKeepOrder(profile.keywords || [], 12);
-  const avoid = uniqueKeepOrder(profile.negative_terms || [], 10);
-
-  return JSON.stringify({
-    resume_profile: {
-      resume_type: clean(profile.category, 120),
-      function: clean(profile.function, 120),
-      domain: clean(profile.domain, 120),
-      target_titles: titles,
-      skill_keywords: keywords,
-      avoid_terms: avoid,
-    },
-    filters: {
-      country: clean(filters.country, 120),
-      city_or_region: clean(filters.region, 120),
-      work_mode: clean(filters.workMode, 40),
-      posted_window: clean(filters.posted, 40),
-    },
-    instructions: {
-      use_live_web_search: true,
-      direct_job_pages_only: true,
-      no_expired_jobs: true,
-      max_results: Math.max(target, 8),
-      return_json_only: true,
-      output_schema: {
-        jobs: [
-          {
-            title: 'string',
-            company: 'string',
-            url: 'string',
-            location: 'string',
-            country: 'string',
-            work_mode: 'string',
-            posted_date: 'string',
-            snippet: 'string',
-          },
-        ],
-      },
-    },
-  });
-}
-
-function buildChatWebSearchOptions(country, region, contextSize = 'low') {
-  const options = { search_context_size: contextSize };
-  const countryCode = toIso2(country);
-  const locality = clean(region, 80);
-  if (countryCode || locality) {
-    const approximate = {};
-    if (countryCode) approximate.country = countryCode;
-    if (locality) {
-      approximate.city = locality;
-      approximate.region = locality;
-    }
-    options.user_location = {
-      type: 'approximate',
-      approximate,
-    };
-  }
-  return options;
-}
-
-function extractChatTextAndSources(data) {
-  const text = extractChatText(data);
-  const message = data?.choices?.[0]?.message || {};
-  const annotations = Array.isArray(message.annotations) ? message.annotations : [];
-  const sources = [];
-  for (const item of annotations) {
-    const citation = item?.url_citation && typeof item.url_citation === 'object' ? item.url_citation : item;
-    const url = clean(citation?.url, 500);
-    if (!url) continue;
-    sources.push({
-      url,
-      title: clean(citation?.title, 220),
-    });
-  }
-  return { text, sources: dedupeUrlRows(sources, 'url') };
-}
-
-function extractChatText(data) {
-  const message = data?.choices?.[0]?.message || {};
-  if (typeof message.content === 'string') return message.content.trim();
-  if (Array.isArray(message.content)) {
-    return message.content.map((part) => clean(part?.text || part?.content || '', 12000)).filter(Boolean).join('\n').trim();
-  }
-  return '';
-}
-
-function dedupeUrlRows(rows, field = 'url') {
-  const out = [];
-  const seen = new Set();
-  for (const row of rows || []) {
-    const key = clean(row?.[field], 500).toLowerCase();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(row);
-  }
-  return out;
-}
-
-function shouldStopTryingSearchModel(message) {
-  const low = String(message || '').toLowerCase();
-  return low.includes('model_not_found')
-    || low.includes('unsupported model')
-    || low.includes('does not exist')
-    || low.includes('not found');
-}
-
 function buildStructuredSearchPrompt(attempt, target) {
-
   const { filters, focusTitles, profile } = attempt;
   const titles = uniqueKeepOrder([...(focusTitles || []), ...(profile.role_titles || [])], 6);
   const keywords = uniqueKeepOrder(profile.keywords || [], 12);
@@ -950,7 +753,6 @@ async function scoreJobsWithOpenAI({ apiKey, model, resumeContext, jobs }) {
     apiKey,
     payload: {
       model,
-      temperature: 0.2,
       messages: [
         { role: 'system', content: 'You are a strict resume-to-job scoring assistant. Score every provided job from 0 to 100 for overall fit. Return only JSON.' },
         { role: 'user', content: JSON.stringify(payload) },
@@ -1297,13 +1099,10 @@ function canonicalizePostedRange(value) {
 
 function buildResponsesUserLocation(country, region) {
   const countryCode = toIso2(country);
-  const locality = clean(region, 80);
-  if (!countryCode && !locality) return null;
+  if (!countryCode && !region) return null;
   return {
     type: 'approximate',
     country: countryCode || undefined,
-    city: locality || undefined,
-    region: locality || undefined,
   };
 }
 
@@ -1531,14 +1330,21 @@ async function requestOpenAIJson({ url, apiKey, payload, attempts = 2 }) {
     const text = await response.text().catch(() => '');
     lastMessage = text || `OpenAI request failed (${response.status}).`;
 
-    if (response.status === 400 && shouldRetryWithoutInclude(lastMessage) && activePayload && typeof activePayload === 'object' && 'include' in activePayload) {
-      const { include, ...rest } = activePayload;
-      activePayload = rest;
-      if (attempt < attempts) continue;
+    if (response.status === 400 && activePayload && typeof activePayload === 'object') {
+      if (shouldRetryWithoutInclude(lastMessage) && 'include' in activePayload) {
+        const { include, ...rest } = activePayload;
+        activePayload = rest;
+        if (attempt < attempts) continue;
+      }
+      if (shouldRetryWithoutTemperature(lastMessage) && 'temperature' in activePayload) {
+        const { temperature, ...rest } = activePayload;
+        activePayload = rest;
+        if (attempt < attempts) continue;
+      }
     }
 
-    if ((response.status === 429 || response.status >= 500) && attempt < attempts) {
-      await sleep(response.status >= 500 ? 1800 * attempt : 1200 * attempt);
+    if (response.status === 429 && attempt < attempts) {
+      await sleep(1200 * attempt);
       continue;
     }
     throw new Error(lastMessage);
@@ -1553,6 +1359,14 @@ function shouldRetryWithoutInclude(message) {
     || low.includes('param: include')
     || (low.includes('include') && low.includes('not enabled for this organization'))
     || (low.includes('web_search_call.results') && low.includes('invalid_request_error'));
+}
+
+function shouldRetryWithoutTemperature(message) {
+  const low = String(message || '').toLowerCase();
+  return (low.includes('temperature') && low.includes('model incompatible request argument'))
+    || (low.includes('temperature') && low.includes('invalid_request_error'))
+    || low.includes('unsupported parameter: temperature')
+    || low.includes('unsupported value for temperature');
 }
 
 function sleep(ms) {
