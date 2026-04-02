@@ -362,7 +362,6 @@ async function performStructuredSearchAttempt({ apiKey, webModel, attempt, targe
     model: webModel,
     tools: [tool],
     tool_choice: 'auto',
-    include: ['web_search_call.action.sources'],
     instructions: 'You are a resume-to-job matching agent. Use live web search to find real, current job postings. Prefer direct job-detail URLs. Never invent a URL. Return only JSON that matches the schema.',
     input: buildStructuredSearchPrompt(attempt, target),
     text: {
@@ -495,7 +494,6 @@ async function performSearchAttempt({ apiKey, webModel, attempt }) {
     model: webModel,
     tools: [tool],
     tool_choice: 'auto',
-    include: ['web_search_call.action.sources', 'web_search_call.results'],
     input: buildSearchPrompt(attempt),
     max_output_tokens: 900,
     store: false,
@@ -1316,6 +1314,8 @@ function cleanError(error) {
 
 async function requestOpenAIJson({ url, apiKey, payload, attempts = 2 }) {
   let lastMessage = 'OpenAI request failed.';
+  let activePayload = payload;
+
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const response = await fetch(url, {
       method: 'POST',
@@ -1323,13 +1323,19 @@ async function requestOpenAIJson({ url, apiKey, payload, attempts = 2 }) {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(activePayload),
     });
 
     if (response.ok) return response.json();
 
     const text = await response.text().catch(() => '');
     lastMessage = text || `OpenAI request failed (${response.status}).`;
+
+    if (response.status === 400 && shouldRetryWithoutInclude(lastMessage) && activePayload && typeof activePayload === 'object' && 'include' in activePayload) {
+      const { include, ...rest } = activePayload;
+      activePayload = rest;
+      if (attempt < attempts) continue;
+    }
 
     if (response.status === 429 && attempt < attempts) {
       await sleep(1200 * attempt);
@@ -1338,6 +1344,15 @@ async function requestOpenAIJson({ url, apiKey, payload, attempts = 2 }) {
     throw new Error(lastMessage);
   }
   throw new Error(lastMessage);
+}
+
+function shouldRetryWithoutInclude(message) {
+  const low = String(message || '').toLowerCase();
+  return low.includes('param":"include')
+    || low.includes('param":"include')
+    || low.includes('param: include')
+    || (low.includes('include') && low.includes('not enabled for this organization'))
+    || (low.includes('web_search_call.results') && low.includes('invalid_request_error'));
 }
 
 function sleep(ms) {
