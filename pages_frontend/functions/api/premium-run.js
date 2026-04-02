@@ -211,63 +211,79 @@ function normalizeFilters(input) {
 async function searchLiveJobsWithOpenAI({ apiKey, webModel, resumeContext, filters, maxResults }) {
   const target = Math.max(1, Math.min(Number(maxResults || TARGET_RESULTS), TARGET_RESULTS));
   const profile = deriveResumeSearchProfile(resumeContext);
-  const jobs = await callOpenAILiveSearchOnce({
-    apiKey,
-    webModel,
-    resumeContext,
-    filters,
-    requestedCount: target,
-  });
+  const merged = new Map();
+  const attempts = broadeningPlan(filters);
 
-  const normalized = jobs
-    .map((item) => normalizeLiveJobRow(item))
-    .filter((row) => row && row.url && row.title);
+  for (const attemptFilters of attempts) {
+    if (merged.size >= target) break;
+    const requestedCount = Math.max(3, Math.min(target - merged.size, target));
+    const jobs = await callOpenAILiveSearchOnce({
+      apiKey,
+      webModel,
+      resumeContext,
+      filters: attemptFilters,
+      requestedCount,
+    }).catch(() => []);
 
-  const filtered = filterLiveRows(normalized, filters);
-  const selected = (filtered.length ? filtered : normalized)
-    .map((row) => {
-      const relevance = Number.isFinite(Number(row.relevance_score))
-        ? Number(row.relevance_score)
-        : jobRelevanceScore(profile, {
-            title: row.title,
-            descriptionText: row.description_text,
-            pageText: row.page_text || row.description_text,
-          });
-      const pct = clamp(Number(row.match_percentage || 0) || relevanceToPercent(relevance), 0, 100);
-      return {
-        ...row,
-        relevance_score: relevance,
-        match_percentage: pct,
-        reason: clean(row.reason, 160) || 'Live web match',
-        search_model: clean(row.search_model, 120) || webModel,
-      };
-    })
+    const normalized = jobs
+      .map((item) => normalizeLiveJobRow(item))
+      .filter((row) => row && row.url && row.title);
+
+    const filtered = filterLiveRows(normalized, attemptFilters);
+    const selected = (filtered.length ? filtered : normalized)
+      .map((row) => {
+        const relevance = Number.isFinite(Number(row.relevance_score))
+          ? Number(row.relevance_score)
+          : jobRelevanceScore(profile, {
+              title: row.title,
+              descriptionText: row.description_text,
+              pageText: row.page_text || row.description_text,
+            });
+        const pct = clamp(Number(row.match_percentage || 0) || relevanceToPercent(relevance), 0, 100);
+        return {
+          ...row,
+          relevance_score: relevance,
+          match_percentage: pct,
+          reason: clean(row.reason, 160) || 'Live web match',
+          search_model: clean(row.search_model, 120) || webModel,
+        };
+      })
+      .sort((a, b) => (Number(b.match_percentage || 0) - Number(a.match_percentage || 0)) || compareRows(a, b));
+
+    for (const row of selected) {
+      const key = String(row.url || row.job_id || '').trim().toLowerCase();
+      if (!key || merged.has(key)) continue;
+      merged.set(key, row);
+      if (merged.size >= target) break;
+    }
+  }
+
+  return [...merged.values()]
     .sort((a, b) => (Number(b.match_percentage || 0) - Number(a.match_percentage || 0)) || compareRows(a, b))
     .slice(0, target);
-
-  return selected;
 }
 
 
 async function callOpenAILiveSearchOnce({ apiKey, webModel, resumeContext, filters, requestedCount }) {
   const toolEntry = {
     type: 'web_search',
-    external_web_access: true,
-    search_context_size: 'low',
+    search_context_size: 'medium',
   };
   const userLocation = buildResponsesUserLocation(filters.country, filters.region);
   if (userLocation) toolEntry.user_location = userLocation;
 
-  const payload = {
+  const strictPrompt = makeCompactLiveSearchPrompt({
+    resumeContext,
+    filters,
+    requestedCount,
+  });
+
+  const strictPayload = {
     model: webModel,
     tools: [toolEntry],
     tool_choice: 'auto',
     include: ['web_search_call.action.sources'],
-    input: makeCompactLiveSearchPrompt({
-      resumeContext,
-      filters,
-      requestedCount,
-    }),
+    input: strictPrompt,
     text: {
       format: {
         type: 'json_schema',
@@ -276,25 +292,43 @@ async function callOpenAILiveSearchOnce({ apiKey, webModel, resumeContext, filte
         schema: buildLiveJobsSchema(requestedCount),
       },
     },
-    max_output_tokens: 1100,
+    max_output_tokens: 1200,
     reasoning: { effort: 'low' },
     store: false,
   };
 
-  const data = await requestOpenAIJson({
+  let data = await requestOpenAIJson({
     url: OPENAI_RESPONSES_URL,
     apiKey,
-    payload,
+    payload: strictPayload,
     attempts: 2,
-  });
+  }).catch(() => null);
 
-  const parsed = extractResponsesJsonPayload(data);
-  const directJobs = Array.isArray(parsed?.jobs)
-    ? parsed.jobs.filter((item) => item && typeof item === 'object')
-    : [];
-  if (directJobs.length) {
-    return directJobs.map((item) => ({ ...item, search_model: webModel }));
-  }
+  let jobs = extractJobsFromResponsesPayload(data, webModel);
+  if (jobs.length) return jobs;
+
+  const fallbackPayload = {
+    model: webModel,
+    tools: [toolEntry],
+    tool_choice: 'auto',
+    include: ['web_search_call.action.sources'],
+    input: `${strictPrompt}
+
+If there are only a few good matches, return fewer jobs instead of none. Return ONLY compact JSON with a top-level jobs array.`,
+    max_output_tokens: 1000,
+    reasoning: { effort: 'low' },
+    store: false,
+  };
+
+  data = await requestOpenAIJson({
+    url: OPENAI_RESPONSES_URL,
+    apiKey,
+    payload: fallbackPayload,
+    attempts: 1,
+  }).catch(() => null);
+
+  jobs = extractJobsFromResponsesPayload(data, webModel);
+  if (jobs.length) return jobs;
 
   const sourceRows = sourceRowsFromSearchSources({
     sources: collectSourceUrls(data),
@@ -305,8 +339,9 @@ async function callOpenAILiveSearchOnce({ apiKey, webModel, resumeContext, filte
   });
   if (sourceRows.length) return sourceRows;
 
-  throw new Error('Premium live web search could not find usable job results.');
+  return [];
 }
+
 
 
 async function chatSearchForSourceRows({ apiKey, chatSearchModel, resumeContext, filters, requestedCount, excludeUrls, focusTitles }) {
@@ -933,7 +968,7 @@ function buildLiveJobsSchema(requestedCount) {
             match_percentage: { type: 'number' },
             reason: { type: 'string' },
           },
-          required: ['title', 'company', 'url', 'location', 'country', 'work_mode', 'posted_date', 'description_text', 'match_percentage', 'reason'],
+          required: ['title', 'url', 'match_percentage', 'reason'],
         },
       },
     },
@@ -943,32 +978,51 @@ function buildLiveJobsSchema(requestedCount) {
 
 function makeCompactLiveSearchPrompt({ resumeContext, filters, requestedCount }) {
   const profile = deriveResumeSearchProfile(resumeContext);
+  const titles = uniqueKeepOrder(profile.role_titles || [], 6);
+  const keywords = uniqueKeepOrder(profile.keywords || [], 14);
+  const avoidTerms = uniqueKeepOrder(profile.negative_terms || [], 10);
+  const resumePayload = {
+    country: clean(resumeContext.candidate_country, 120),
+    experience_years: resumeContext.candidate_experience_years,
+    degree_level: clean(resumeContext.candidate_degree_level, 80),
+    degree_family: clean(resumeContext.candidate_degree_family, 120),
+    degree_fields: Array.isArray(resumeContext.candidate_degree_fields) ? resumeContext.candidate_degree_fields.slice(0, 8) : [],
+    category: clean(resumeContext.candidate_category || resumeContext.candidate_category_key, 120),
+    function: clean(resumeContext.candidate_function, 120),
+    domain: clean(resumeContext.candidate_domain, 120),
+    summary: clean(resumeContext.summary, 1000),
+    skills: clean(resumeContext.skills, 1200),
+    experience: clean(resumeContext.experience, 1200),
+    projects: clean(resumeContext.projects, 800),
+    education: clean(resumeContext.education, 800),
+    resume_text_excerpt: clean(resumeContext.resume_text, 2200),
+  };
+  const requested = Math.max(1, Number(requestedCount || TARGET_RESULTS));
   return [
-    `Find up to ${Math.max(1, Number(requestedCount || TARGET_RESULTS))} CURRENT job postings that best fit this candidate.`,
-    'Use live web search. Prefer direct job-detail pages from employer ATS/careers sites.',
-    'Do not return generic search pages, list pages, or homepage URLs.',
-    'Return only jobs that are reasonably relevant to the resume.',
-    `Target country: ${filters.country || 'any'}`,
-    filters.region ? `Target city/region: ${filters.region}` : '',
-    filters.workMode ? `Preferred work mode: ${filters.workMode}` : '',
-    filters.posted && filters.posted !== 'all' ? `Freshness: ${filters.posted}` : '',
-    `Best-fit titles: ${(profile.role_titles || []).slice(0, 5).join(', ') || 'not specified'}`,
-    `Important skills: ${(profile.keywords || []).slice(0, 12).join(', ') || 'not specified'}`,
-    profile.negative_terms?.length ? `Avoid roles like: ${profile.negative_terms.slice(0, 8).join(', ')}` : '',
-    `Resume summary: ${clean(resumeContext.summary, 900)}`,
-    `Resume skills: ${clean(resumeContext.skills, 1200)}`,
-    `Resume experience: ${clean(resumeContext.experience, 1200)}`,
-    `Resume projects: ${clean(resumeContext.projects, 800)}`,
-  ].filter(Boolean).join('\n');
+    `Use live web search to find up to ${requested} CURRENT job-posting detail pages that fit this resume.`,
+    'Use only the resume-derived role titles, technical signals, and user filters below.',
+    'Prefer employer ATS or direct job-detail pages. If there are too few, a specific job-detail page on a major job board is acceptable.',
+    'Do not return category pages, search results pages, homepages, or broad directory pages.',
+    'If the selected city is too strict, broaden within the selected country and still return the best relevant jobs instead of none.',
+    `User filters: ${JSON.stringify({ country: filters.country || 'any', city: filters.region || 'any', work_mode: filters.workMode || 'any', posted_range: filters.posted || 'all' })}`,
+    `Resume-derived role titles: ${JSON.stringify(titles)}`,
+    `Strong resume keywords: ${JSON.stringify(keywords)}`,
+    avoidTerms.length ? `Avoid unrelated families: ${JSON.stringify(avoidTerms)}` : '',
+    `Candidate summary: ${JSON.stringify(resumePayload)}`,
+    'Return only valid JSON in this exact shape: {"jobs":[{"title":"string","company":"string","url":"string","location":"string","country":"string","work_mode":"string","posted_date":"string","description_text":"string","match_percentage":0,"reason":"short string"}]}',
+    'Never invent links. Omit closed jobs. It is okay to return fewer than requested.'
+  ].filter(Boolean).join(' ');
 }
 
-function extractResponsesJsonPayload(data) {
-  if (data && typeof data.output_parsed === 'object' && data.output_parsed) return data.output_parsed;
-  const raw = clean(extractTextFromResponsesPayload(data), 12000);
-  if (!raw) return {};
-  const parsed = extractJsonObject(raw);
-  return parsed && typeof parsed === 'object' ? parsed : {};
+function extractJobsFromResponsesPayload(data, searchModel = '') {
+  if (!data || typeof data !== 'object') return [];
+  const parsed = extractResponsesJsonPayload(data);
+  const direct = Array.isArray(parsed?.jobs)
+    ? parsed.jobs.filter((item) => item && typeof item === 'object')
+    : extractJsonArray(extractTextFromResponsesPayload(data));
+  return direct.map((item) => ({ ...item, search_model: clean(item.search_model, 120) || searchModel }));
 }
+
 
 function postedLabelFromFilter(value) {
   const low = clean(value, 40).toLowerCase();
