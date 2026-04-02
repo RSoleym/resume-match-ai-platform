@@ -5,6 +5,8 @@ const DEFAULT_SCORING_MODEL = 'gpt-4o-mini';
 const MAX_PREMIUM_SEARCHES = 3;
 const TARGET_RESULTS = 5;
 const MAX_FETCHED_PAGES = 8;
+const MAX_FILTERED_FETCHED_PAGES = 12;
+const MAX_SEARCH_ATTEMPTS = 6;
 
 const COUNTRY_TO_ISO2 = {
   canada: 'CA',
@@ -235,9 +237,13 @@ function normalizeFilters(input) {
   };
 }
 
+function hasActiveFilters(filters) {
+  return !!(clean(filters?.country, 80) || clean(filters?.region, 80) || clean(filters?.workMode, 40) || (clean(filters?.posted, 40) && clean(filters?.posted, 40) !== 'all'));
+}
+
 async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resumeContext, filters, maxResults }) {
   const target = clamp(Number(maxResults || TARGET_RESULTS), 1, TARGET_RESULTS);
-  const attempts = buildSearchAttempts(resumeContext, filters).slice(0, 3);
+  const attempts = buildSearchAttempts(resumeContext, filters).slice(0, MAX_SEARCH_ATTEMPTS);
   const merged = new Map();
 
   for (const attempt of attempts) {
@@ -311,8 +317,8 @@ function buildSearchAttempts(resumeContext, filters) {
 
   const out = [];
   const seen = new Set();
-  for (const plan of plans) {
-    for (const focusTitles of roleBatches) {
+  for (const focusTitles of roleBatches) {
+    for (const plan of plans) {
       const key = JSON.stringify({ plan, focusTitles });
       if (seen.has(key)) continue;
       seen.add(key);
@@ -477,9 +483,10 @@ function normalizeSearchHits(hits, attempt) {
 async function enrichHitsWithPages(rows, attempt) {
   const out = [];
   let fetched = 0;
+  const fetchLimit = hasActiveFilters(attempt?.filters) ? MAX_FILTERED_FETCHED_PAGES : MAX_FETCHED_PAGES;
   for (const row of rows) {
     let enriched = { ...row };
-    const shouldFetch = fetched < MAX_FETCHED_PAGES && looksFetchableJobUrl(row.url);
+    const shouldFetch = fetched < fetchLimit && looksFetchableJobUrl(row.url);
     if (shouldFetch) {
       fetched += 1;
       const meta = await fetchJobPageMetadata(row.url).catch(() => ({}));
@@ -947,7 +954,6 @@ function buildResponsesUserLocation(country, region) {
   return {
     type: 'approximate',
     country: countryCode || undefined,
-    city: region || undefined,
   };
 }
 
