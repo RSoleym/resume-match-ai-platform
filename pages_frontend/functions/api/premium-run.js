@@ -4,7 +4,7 @@ const DEFAULT_WEB_MODEL = 'gpt-5';
 const DEFAULT_SCORING_MODEL = 'gpt-4o-mini';
 const MAX_PREMIUM_SEARCHES = 3;
 const TARGET_RESULTS = 5;
-const MAX_FETCHED_PAGES = 4;
+const MAX_FETCHED_PAGES = 8;
 
 const COUNTRY_TO_ISO2 = {
   canada: 'CA',
@@ -237,38 +237,24 @@ function normalizeFilters(input) {
 
 async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resumeContext, filters, maxResults }) {
   const target = clamp(Number(maxResults || TARGET_RESULTS), 1, TARGET_RESULTS);
-  const attempts = buildSearchAttempts(resumeContext, filters).slice(0, 4);
+  const attempts = buildSearchAttempts(resumeContext, filters).slice(0, 3);
   const merged = new Map();
-  const upstreamErrors = [];
 
   for (const attempt of attempts) {
     if (merged.size >= Math.max(target, 6)) break;
 
-    let candidateRows = [];
-
+    let rawHits = [];
     try {
-      const structuredHits = await performStructuredSearchAttempt({ apiKey, webModel, attempt, target });
-      if (structuredHits.length) {
-        candidateRows = normalizeStructuredSearchRows(structuredHits, attempt);
-      }
-    } catch (error) {
-      upstreamErrors.push(cleanError(error));
+      rawHits = await performSearchAttempt({ apiKey, webModel, attempt });
+    } catch {
+      rawHits = [];
     }
+    if (!rawHits.length) continue;
 
-    if (!candidateRows.length) {
-      try {
-        const rawHits = await performSearchAttempt({ apiKey, webModel, attempt });
-        if (rawHits.length) {
-          candidateRows = normalizeSearchHits(rawHits, attempt);
-        }
-      } catch (error) {
-        upstreamErrors.push(cleanError(error));
-      }
-    }
+    const normalizedHits = normalizeSearchHits(rawHits, attempt);
+    if (!normalizedHits.length) continue;
 
-    if (!candidateRows.length) continue;
-
-    const enriched = await enrichHitsWithPages(candidateRows, attempt);
+    const enriched = await enrichHitsWithPages(normalizedHits, attempt);
     const filtered = filterAndRankRows(enriched, resumeContext, attempt.filters);
 
     for (const row of filtered) {
@@ -280,12 +266,7 @@ async function searchLiveJobsWithOpenAI({ apiKey, webModel, scoringModel, resume
   }
 
   let rows = Array.from(merged.values()).sort(compareRows).slice(0, Math.max(target, 8));
-  if (!rows.length) {
-    if (upstreamErrors.length) {
-      throw new Error(upstreamErrors[0]);
-    }
-    return [];
-  }
+  if (!rows.length) return [];
 
   try {
     const scored = await scoreJobsWithOpenAI({
@@ -341,76 +322,6 @@ function buildSearchAttempts(resumeContext, filters) {
   return out;
 }
 
-async function performStructuredSearchAttempt({ apiKey, webModel, attempt, target }) {
-  const tool = {
-    type: 'web_search',
-    search_context_size: 'medium',
-    filters: {
-      allowed_domains: allowedDomainsForAttempt(attempt),
-    },
-  };
-  const location = buildResponsesUserLocation(attempt.filters.country, attempt.filters.region);
-  if (location) tool.user_location = location;
-
-  const payload = {
-    model: webModel,
-    tools: [tool],
-    tool_choice: 'auto',
-    include: ['web_search_call.action.sources'],
-    instructions: 'You are a resume-to-job matching agent. Use web search to find real, current job postings. Prefer direct job-detail URLs. Never invent a URL. Return only JSON that matches the schema.',
-    input: buildStructuredSearchPrompt(attempt, target),
-    text: {
-      format: {
-        type: 'json_schema',
-        name: 'live_job_search_results',
-        strict: true,
-        schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            jobs: {
-              type: 'array',
-              items: {
-                type: 'object',
-                additionalProperties: false,
-                properties: {
-                  title: { type: 'string' },
-                  company: { type: 'string' },
-                  url: { type: 'string' },
-                  location: { type: 'string' },
-                  country: { type: 'string' },
-                  work_mode: { type: 'string' },
-                  posted_date: { type: 'string' },
-                  snippet: { type: 'string' }
-                },
-                required: ['title', 'company', 'url', 'location', 'country', 'work_mode', 'posted_date', 'snippet']
-              }
-            }
-          },
-          required: ['jobs']
-        }
-      }
-    },
-    max_output_tokens: 1600,
-    store: false,
-  };
-  if (/^(gpt-5|o3|o4)/i.test(webModel)) payload.reasoning = { effort: 'low' };
-
-  const data = await requestOpenAIJson({
-    url: OPENAI_RESPONSES_URL,
-    apiKey,
-    payload,
-    attempts: 2,
-  });
-
-  const parsed = extractJsonObject(extractTextFromResponsesPayload(data));
-  const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
-  return jobs.filter((job) => {
-    const url = clean(job?.url, 500);
-    return /^https?:\/\//i.test(url);
-  }).slice(0, Math.max(target, 6));
-}
-
 async function performSearchAttempt({ apiKey, webModel, attempt }) {
   const tool = {
     type: 'web_search',
@@ -425,8 +336,8 @@ async function performSearchAttempt({ apiKey, webModel, attempt }) {
   const payload = {
     model: webModel,
     tools: [tool],
-    tool_choice: 'auto',
-    include: ['web_search_call.action.sources'],
+    tool_choice: 'required',
+    include: ['web_search_call.action.sources', 'web_search_call.results'],
     input: buildSearchPrompt(attempt),
     max_output_tokens: 900,
     store: false,
@@ -441,65 +352,6 @@ async function performSearchAttempt({ apiKey, webModel, attempt }) {
   });
 
   return collectSearchCandidates(data);
-}
-
-function normalizeStructuredSearchRows(jobs, attempt) {
-  const rows = [];
-  const seen = new Set();
-
-  for (const item of Array.isArray(jobs) ? jobs : []) {
-    const url = clean(item?.url, 500);
-    if (!/^https?:\/\//i.test(url)) continue;
-    const key = url.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
-
-    const title = clean(item?.title, 220);
-    if (!title) continue;
-
-    const location = clean(item?.location, 220) || clean([attempt.filters.region, attempt.filters.country].filter(Boolean).join(', '), 220);
-    rows.push({
-      job_id: `WEB-${simpleHash(url)}`,
-      title,
-      company: clean(item?.company, 180) || titleCase(clean(hostFromUrl(url).split('.')[0]?.replace(/[-_]+/g, ' '), 180)),
-      url,
-      source_url: url,
-      location,
-      country: normalizeCountryName(clean(item?.country || guessCountryFromText(location), 120)) || normalizeCountryName(clean(attempt.filters.country, 120)),
-      work_mode: canonicalizeWorkMode(item?.work_mode) || inferWorkMode(title, location, clean(item?.snippet, 1200)) || '',
-      posted_date: parseRelativePostedDate(item?.posted_date) || postedLabelFromFilter(attempt.filters.posted),
-      description_text: clean(item?.snippet, 1800),
-      page_text: clean(item?.snippet, 2200),
-      reason: 'Found from live web search',
-      search_model: '',
-      relevance_score: 0,
-      match_percentage: 0,
-      host: hostFromUrl(url),
-    });
-  }
-
-  return rows;
-}
-
-function buildStructuredSearchPrompt(attempt, target) {
-  const { filters, focusTitles, profile } = attempt;
-  const titles = uniqueKeepOrder([...(focusTitles || []), ...(profile.role_titles || [])], 6);
-  const keywords = uniqueKeepOrder(profile.keywords || [], 12);
-  const avoid = uniqueKeepOrder(profile.negative_terms || [], 10);
-
-  return [
-    `Find ${Math.max(target, 5)} current engineering job postings that best match this resume profile.`,
-    `Primary role titles: ${titles.join(', ') || 'best matching engineering roles'}.`,
-    keywords.length ? `Required skill keywords to prioritize: ${keywords.join(', ')}.` : '',
-    avoid.length ? `Avoid unrelated roles and domains: ${avoid.join(', ')}.` : '',
-    `Country filter: ${filters.country || 'any'}.`,
-    `City or region filter: ${filters.region || 'any'}.`,
-    `Work mode filter: ${filters.workMode || 'any'}.`,
-    `Posted date filter: ${filters.posted || 'all'}.`,
-    'Use live web search and prefer direct job-detail pages from ATS systems or major job boards.',
-    'Every result must be a real live posting with a real URL.',
-    'If a field cannot be verified from the source, return an empty string for that field instead of guessing.',
-  ].filter(Boolean).join(' ');
 }
 
 function buildSearchPrompt(attempt) {
@@ -606,10 +458,10 @@ function normalizeSearchHits(hits, attempt) {
       company: inferredCompany ? titleCase(inferredCompany) : '',
       url,
       source_url: url,
-      location: clean([attempt.filters.region, attempt.filters.country].filter(Boolean).join(', '), 180),
-      country: normalizeCountryName(clean(attempt.filters.country, 120)),
-      work_mode: canonicalizeWorkMode(attempt.filters.workMode) || inferWorkMode(inferredTitle, '', snippet) || '',
-      posted_date: postedLabelFromFilter(attempt.filters.posted),
+      location: clean(extractLocationFromText(snippet), 180),
+      country: normalizeCountryName(guessCountryFromText(snippet)),
+      work_mode: canonicalizeWorkMode(inferWorkMode(inferredTitle, '', snippet)) || '',
+      posted_date: extractPostedDateFromText(snippet),
       description_text: snippet,
       page_text: snippet,
       reason: 'Found from live web search',
@@ -631,14 +483,15 @@ async function enrichHitsWithPages(rows, attempt) {
     if (shouldFetch) {
       fetched += 1;
       const meta = await fetchJobPageMetadata(row.url).catch(() => ({}));
+      const mergedText = `${meta.location || ''} ${meta.description_text || ''} ${meta.page_text || ''}`;
       enriched = {
         ...enriched,
         title: clean(meta.title || enriched.title, 220),
         company: clean(meta.company || enriched.company, 180),
-        location: clean(meta.location || enriched.location, 180),
-        country: normalizeCountryName(clean(meta.country || enriched.country || guessCountryFromText(meta.location || ''), 120)),
+        location: clean(meta.location || enriched.location || extractLocationFromText(mergedText), 180),
+        country: normalizeCountryName(clean(meta.country || guessCountryFromText(mergedText) || enriched.country, 120)),
         work_mode: canonicalizeWorkMode(meta.work_mode || enriched.work_mode || inferWorkMode(meta.title || enriched.title, meta.location || '', meta.page_text || meta.description_text || '')),
-        posted_date: clean(meta.posted_date || enriched.posted_date, 80),
+        posted_date: clean(meta.posted_date || extractPostedDateFromText(mergedText) || enriched.posted_date, 80),
         description_text: clean(meta.description_text || enriched.description_text, 1800),
         page_text: clean(meta.page_text || meta.description_text || enriched.page_text || enriched.description_text, 2600),
       };
@@ -668,16 +521,18 @@ function filterAndRankRows(rows, resumeContext, filters) {
     const workMode = canonicalizeWorkMode(row.work_mode || inferWorkMode(title, location, pageText));
     const postedDate = clean(row.posted_date, 80);
 
-    const countryOk = !filters.country || country === filters.country || workMode === 'Remote' || !country;
-    const regionOk = !filters.region || locationQueryMatch(filters.region, location);
+    const signalText = `${location} ${title} ${descriptionText.slice(0, 700)} ${pageText.slice(0, 1200)}`;
+    const countryOk = !filters.country || country === filters.country || (!country && textMentionsCountry(signalText, filters.country));
+    const regionOk = !filters.region || locationQueryMatch(filters.region, signalText);
     const workOk = !filters.workMode || workMode === filters.workMode || !workMode;
     const postedOk = !postedDate || postedDate === 'Unknown' || dateFilterMatch(postedDate, filters.posted);
 
     const relevance = jobRelevanceScore(profile, { title, descriptionText, pageText });
-    const boosted = relevance + (looksLikeDirectJobUrl(row.url) ? 1.2 : 0) + (countryOk ? 0.4 : -0.8) + (regionOk ? 0.2 : 0) + (workOk ? 0.2 : -0.4);
+    const boosted = relevance + (looksLikeDirectJobUrl(row.url) ? 1.2 : 0) + (countryOk ? 0.4 : -1.4) + (regionOk ? 0.3 : -1.2) + (workOk ? 0.2 : -0.6);
 
     if (titleTooGeneric(title, pageText)) continue;
     if (!countryOk) continue;
+    if (!regionOk) continue;
     if (!workOk) continue;
     if (!postedOk && filters.posted !== 'all') continue;
 
@@ -765,7 +620,7 @@ function buildPremiumLiveResultRows(resumeId, liveRows, premiumModel) {
   const rows = liveRows.map((job, index) => {
     const score = clamp(Number(job.match_percentage || 0), 0, 100);
     const location = clean(job.location, 180);
-    const country = normalizeCountryName(clean(job.country || guessCountryFromText(location), 120));
+    const country = normalizeCountryName(clean(job.country || guessCountryFromText(`${location} ${job.description_text || ''}`), 120));
     return {
       resume_id: resumeId,
       job_id: clean(job.job_id || job.url || `WEB-${String(index + 1).padStart(5, '0')}`, 260),
@@ -1163,13 +1018,54 @@ function locationQueryMatch(query, location) {
 }
 
 function guessCountryFromText(text) {
-  const low = clean(text, 300).toLowerCase();
+  const low = clean(text, 1200).toLowerCase();
   if (!low) return '';
   for (const [name] of Object.entries(COUNTRY_TO_ISO2)) {
     if (low.includes(name)) return titleCase(name);
   }
-  if (['toronto', 'ontario', 'vancouver', 'canada'].some((x) => low.includes(x))) return 'Canada';
-  if (['united states', 'usa', 'new york', 'california', 'texas'].some((x) => low.includes(x))) return 'United States';
+  if (['toronto', 'ontario', 'vancouver', 'british columbia', 'montreal', 'quebec', 'ottawa', 'calgary', 'edmonton', 'waterloo', 'kitchener', 'mississauga', 'canada'].some((x) => low.includes(x))) return 'Canada';
+  if (['united states', 'usa', 'us', 'new york', 'california', 'texas', 'washington', 'massachusetts', 'seattle', 'san francisco', 'austin'].some((x) => low.includes(x))) return 'United States';
+  if (['united kingdom', 'uk', 'great britain', 'england', 'scotland', 'wales', 'northern ireland', 'bristol', 'london', 'manchester', 'cambridge', 'oxford', 'glasgow', 'edinburgh'].some((x) => low.includes(x))) return 'United Kingdom';
+  return '';
+}
+
+function textMentionsCountry(text, expectedCountry) {
+  const blob = clean(text, 1600).toLowerCase();
+  const country = normalizeCountryName(expectedCountry).toLowerCase();
+  if (!blob || !country) return false;
+  if (blob.includes(country)) return true;
+  if (country === 'canada') return ['canada', 'ontario', 'british columbia', 'alberta', 'quebec', 'toronto', 'vancouver', 'montreal', 'ottawa', 'calgary', 'waterloo'].some((x) => blob.includes(x));
+  if (country === 'united states') return ['united states', 'usa', 'u.s.', 'california', 'texas', 'new york', 'washington', 'seattle', 'austin', 'san francisco'].some((x) => blob.includes(x));
+  if (country === 'united kingdom') return ['united kingdom', 'uk', 'great britain', 'england', 'scotland', 'wales', 'northern ireland', 'bristol', 'london', 'manchester', 'cambridge', 'oxford'].some((x) => blob.includes(x));
+  return false;
+}
+
+function extractPostedDateFromText(text) {
+  const raw = clean(text, 500).toLowerCase();
+  if (!raw) return '';
+  const rel = raw.match(/(\d+)\s+(hour|hours|day|days|week|weeks)\s+ago/);
+  if (rel) return parseRelativePostedDate(`${rel[1]} ${rel[2]}`);
+  if (raw.includes('today') || raw.includes('just posted')) return parseRelativePostedDate('today');
+  if (raw.includes('yesterday')) return parseRelativePostedDate('yesterday');
+  const iso = raw.match(/(20\d{2}-\d{2}-\d{2})/);
+  if (iso) return iso[1];
+  return '';
+}
+
+function extractLocationFromText(text) {
+  const raw = clean(text, 600);
+  if (!raw) return '';
+  const patterns = [
+    /(?:location|based in)\s*[:\-]\s*([^|•
+]+)/i,
+    /([A-Z][A-Za-z .'-]+,\s*(?:ON|BC|QC|AB|NS|MB|SK|NB|NL|PE|Canada|United States|USA|United Kingdom|UK))/,
+    /([A-Z][A-Za-z .'-]+,\s*[A-Z][A-Za-z .'-]+)/,
+  ];
+  for (const rx of patterns) {
+    const match = raw.match(rx);
+    const value = clean(match?.[1] || '', 180);
+    if (value) return value;
+  }
   return '';
 }
 
