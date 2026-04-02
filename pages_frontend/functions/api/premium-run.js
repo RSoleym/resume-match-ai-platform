@@ -1,5 +1,5 @@
 const MAX_PREMIUM_SEARCHES = 3;
-const DEFAULT_SEARCH_MODEL = 'gpt-4o-search-preview';
+const DEFAULT_SEARCH_MODEL = 'gpt-5.4-mini';
 const TARGET_RESULTS = 5;
 const MAX_SEARCH_CALLS = 2;
 const MAX_EXCLUDE_URLS = 8;
@@ -25,7 +25,8 @@ export async function onRequestPost(context) {
   const anonKey = readEnv(context.env, ['SUPABASE_ANON_KEY', 'SUPABASE_PUBLISHABLE_KEY']);
   const secretKey = readEnv(context.env, ['SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY']);
   const openAiKey = readEnv(context.env, ['OPENAI_API_KEY', 'OPENAI_KEY']);
-  const searchModel = readEnv(context.env, ['OPENAI_WEB_CHAT_MODEL', 'OPENAI_SEARCH_MODEL', 'OPENAI_MODEL']) || DEFAULT_SEARCH_MODEL;
+  const configuredSearchModel = readEnv(context.env, ['OPENAI_WEB_MODEL', 'OPENAI_SEARCH_MODEL', 'OPENAI_MODEL', 'OPENAI_WEB_CHAT_MODEL']);
+  const searchModels = buildResponseModelCandidates(configuredSearchModel);
 
   const missing = [];
   if (!supabaseUrl) missing.push('SUPABASE_URL');
@@ -62,7 +63,7 @@ export async function onRequestPost(context) {
     const startedAt = Date.now();
     const searchResult = await searchLiveJobsWithOpenAI({
       apiKey: openAiKey,
-      searchModel,
+      searchModels,
       resumeContext,
       filters,
     });
@@ -96,7 +97,7 @@ export async function onRequestPost(context) {
   }
 }
 
-async function searchLiveJobsWithOpenAI({ apiKey, searchModel, resumeContext, filters }) {
+async function searchLiveJobsWithOpenAI({ apiKey, searchModels, resumeContext, filters }) {
   const requestedCountry = clean(filters?.country || resumeContext?.candidate_country || '', 80);
   const requestedRegion = clean(filters?.region || '', 80);
   const requestedWorkMode = clean(filters?.workMode || '', 40);
@@ -111,41 +112,31 @@ async function searchLiveJobsWithOpenAI({ apiKey, searchModel, resumeContext, fi
     posted: postedWindow,
   }).slice(0, MAX_SEARCH_CALLS);
   const focusTitles = makeFocusTitleBatches(resumeContext)[0] || [];
+  const candidateModels = buildResponseModelCandidates(searchModels);
 
   let lastError = '';
   for (const attempt of attempts) {
-    try {
-      const { jobs, sources } = await callChatSearch({
-        apiKey,
-        model: searchModel,
-        resumeContext,
-        filters: attempt,
-        focusTitles,
-        excludeUrls: Array.from(sourceMap.keys()).slice(0, MAX_EXCLUDE_URLS),
-      });
-      addSources(sourceMap, sources);
-      addJobs(merged, jobs, attempt);
-      if (merged.size >= TARGET_RESULTS) break;
-    } catch (error) {
-      lastError = clean(error?.message || error, 600);
+    for (const model of candidateModels) {
+      try {
+        const fallback = await callResponsesSearch({
+          apiKey,
+          model,
+          resumeContext,
+          filters: attempt,
+          focusTitles,
+          excludeUrls: Array.from(sourceMap.keys()).slice(0, MAX_EXCLUDE_URLS),
+        });
+        addSources(sourceMap, fallback.sources);
+        addJobs(merged, fallback.jobs, attempt);
+        if (merged.size >= TARGET_RESULTS) break;
+      } catch (error) {
+        lastError = clean(error?.message || error, 600);
+        if (!isModelAvailabilityError(lastError)) {
+          break;
+        }
+      }
     }
-  }
-
-  if (!merged.size) {
-    try {
-      const fallback = await callResponsesSearch({
-        apiKey,
-        model: searchModel,
-        resumeContext,
-        filters: attempts[0] || { country: requestedCountry, region: requestedRegion, workMode: requestedWorkMode, posted: postedWindow },
-        focusTitles,
-        excludeUrls: Array.from(sourceMap.keys()).slice(0, MAX_EXCLUDE_URLS),
-      });
-      addSources(sourceMap, fallback.sources);
-      addJobs(merged, fallback.jobs, filters);
-    } catch (error) {
-      lastError = clean(error?.message || error, 600);
-    }
+    if (merged.size >= TARGET_RESULTS) break;
   }
 
   if (!merged.size) {
@@ -162,36 +153,6 @@ async function searchLiveJobsWithOpenAI({ apiKey, searchModel, resumeContext, fi
   };
 }
 
-async function callChatSearch({ apiKey, model, resumeContext, filters, focusTitles, excludeUrls }) {
-  const prompt = buildCompactSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, maxResults: TARGET_RESULTS });
-  const webSearchOptions = { search_context_size: 'low' };
-  const userLocation = buildChatUserLocation(filters?.country, filters?.region);
-  if (userLocation) webSearchOptions.user_location = userLocation;
-
-  const body = {
-    model,
-    messages: [
-      {
-        role: 'developer',
-        content: 'Find 5 current direct job-posting pages from the live web that fit the candidate. Do not use database jobs. Avoid search result pages. Return only JSON with a top-level jobs array.',
-      },
-      { role: 'user', content: prompt },
-    ],
-    web_search_options: webSearchOptions,
-    max_completion_tokens: 700,
-    temperature: 0.1,
-  };
-
-  const data = await fetchOpenAiJsonWithRetry({
-    url: 'https://api.openai.com/v1/chat/completions',
-    apiKey,
-    body,
-  });
-  const { text, sources } = extractChatTextAndSources(data);
-  const jobs = normalizeSearchResults(extractJsonArray(text), filters, sources);
-  return { jobs, sources };
-}
-
 async function callResponsesSearch({ apiKey, model, resumeContext, filters, focusTitles, excludeUrls }) {
   const prompt = buildCompactSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, maxResults: TARGET_RESULTS });
   const tool = { type: 'web_search' };
@@ -203,8 +164,14 @@ async function callResponsesSearch({ apiKey, model, resumeContext, filters, focu
     tools: [tool],
     tool_choice: 'auto',
     include: ['web_search_call.action.sources'],
-    input: prompt,
-    max_output_tokens: 900,
+    input: [
+      {
+        role: 'developer',
+        content: 'Find 5 current direct job-posting pages from the live web that fit the candidate. Do not use database jobs. Avoid search result pages. Return only JSON with a top-level jobs array.',
+      },
+      { role: 'user', content: prompt },
+    ],
+    max_output_tokens: 700,
     store: false,
   };
 
@@ -218,6 +185,32 @@ async function callResponsesSearch({ apiKey, model, resumeContext, filters, focu
   const sources = extractSources(data);
   const jobs = normalizeSearchResults(extractJsonArray(text), filters, sources);
   return { jobs, sources };
+}
+
+function buildResponseModelCandidates(input) {
+  const raw = Array.isArray(input) ? input : String(input || '').split(',');
+  const mapped = raw
+    .map((value) => clean(value, 80))
+    .filter(Boolean)
+    .map((value) => mapToResponsesModel(value));
+
+  const defaults = [DEFAULT_SEARCH_MODEL, 'gpt-5', 'gpt-5.4-nano'];
+  return uniqueKeepOrder([...mapped, ...defaults], 5);
+}
+
+function mapToResponsesModel(model) {
+  const value = clean(model, 80);
+  if (!value) return '';
+  const lower = value.toLowerCase();
+  if (lower === 'gpt-4o-search-preview' || lower === 'gpt-4o-mini-search-preview' || lower === 'gpt-5-search-api') {
+    return DEFAULT_SEARCH_MODEL;
+  }
+  return value;
+}
+
+function isModelAvailabilityError(message) {
+  const text = String(message || '').toLowerCase();
+  return text.includes('model not found') || text.includes('does not exist') || text.includes('unsupported model');
 }
 
 async function fetchOpenAiJsonWithRetry({ url, apiKey, body, attempts = 2 }) {
