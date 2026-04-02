@@ -1,12 +1,21 @@
-export async function onRequestPost(context) {
-  const supabaseUrl = context.env.SUPABASE_URL || '';
-  const anonKey = context.env.SUPABASE_ANON_KEY || '';
-  const secretKey = context.env.SUPABASE_SECRET_KEY || '';
-  const premiumCode = (context.env.PREMIUM_ACCESS_CODE || '').trim();
-  const premiumAdminCode = (context.env.PREMIUM_ADMIN_CODE || '').trim();
+const MAX_PREMIUM_SEARCHES = 5;
+const DEFAULT_ONE_TIME_PREMIUM_CODE = 'Capstone2026';
+const DEFAULT_ADMIN_PREMIUM_CODE = 'JBisADemon%92';
 
-  if (!supabaseUrl || !anonKey || !secretKey) {
-    return json({ error: 'Missing Cloudflare backend config.' }, 500);
+export async function onRequestPost(context) {
+  const supabaseUrl = readEnv(context.env, ['SUPABASE_URL']);
+  const anonKey = readEnv(context.env, ['SUPABASE_ANON_KEY', 'SUPABASE_PUBLISHABLE_KEY']);
+  const secretKey = readEnv(context.env, ['SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY']);
+  const premiumCode = readEnv(context.env, ['PREMIUM_ACCESS_CODE']) || DEFAULT_ONE_TIME_PREMIUM_CODE;
+  const premiumAdminCode = readEnv(context.env, ['PREMIUM_ADMIN_CODE']) || DEFAULT_ADMIN_PREMIUM_CODE;
+
+  const missing = [];
+  if (!supabaseUrl) missing.push('SUPABASE_URL');
+  if (!anonKey) missing.push('SUPABASE_ANON_KEY');
+  if (!secretKey) missing.push('SUPABASE_SECRET_KEY');
+
+  if (missing.length) {
+    return json({ error: `Missing Cloudflare backend config: ${missing.join(', ')}.` }, 500);
   }
 
   try {
@@ -17,20 +26,25 @@ export async function onRequestPost(context) {
     if (!code) return json({ error: 'Enter a premium code.' }, 400);
 
     let patch = null;
-    if (premiumAdminCode && code === premiumAdminCode) {
+    const now = new Date().toISOString();
+
+    if (code === premiumAdminCode) {
       patch = {
         premium_access: true,
         premium_admin_access: true,
-        premium_source: 'cloudflare-code',
+        premium_source: 'cloudflare-admin-code',
         premium_admin_source: 'cloudflare-admin-code',
-        premium_granted_at: new Date().toISOString(),
-        premium_admin_granted_at: new Date().toISOString(),
+        premium_granted_at: now,
+        premium_admin_granted_at: now,
+        premium_searches_used: 0,
       };
-    } else if (premiumCode && code === premiumCode) {
+    } else if (code === premiumCode) {
       patch = {
         premium_access: true,
-        premium_source: 'cloudflare-code',
-        premium_granted_at: new Date().toISOString(),
+        premium_admin_access: false,
+        premium_source: 'cloudflare-one-time-code',
+        premium_granted_at: now,
+        premium_searches_used: Math.max(0, MAX_PREMIUM_SEARCHES - 1),
       };
     }
 
@@ -61,6 +75,14 @@ export async function onRequestPost(context) {
   } catch (error) {
     return json({ error: error?.message || 'Unexpected error.' }, 500);
   }
+}
+
+function readEnv(env, keys) {
+  for (const key of keys) {
+    const value = String(env?.[key] || '').trim();
+    if (value) return value;
+  }
+  return '';
 }
 
 function readBearer(request) {

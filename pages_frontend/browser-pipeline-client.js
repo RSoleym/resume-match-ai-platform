@@ -287,33 +287,8 @@
     const analysis = await analyzeResumeFromStorage({ supabaseClient, resumeRow, onProgress });
     await saveResumeAnalysis({ supabaseClient, resumeRow, parsedText: analysis.parsedText, profile: analysis.profile });
 
-    const jobs = await fetchCandidateJobs({
-      filters: {
-        countryMode: filters.country ? 'selected' : 'all',
-        selectedCountries: filters.country ? [filters.country] : [],
-        country: filters.country || '',
-        workMode: filters.workMode || '',
-        posted: filters.posted || 'all',
-        limit: 500,
-      },
-      onProgress,
-    });
-
-    const regionQuery = String(filters.region || '').trim().toLowerCase();
-    const scopedJobs = regionQuery
-      ? jobs.filter((job) => `${job.location || ''} ${job.title || ''}`.toLowerCase().includes(regionQuery))
-      : jobs;
-
-    const localPreRank = await callWorker('match_jobs', {
-      jobs: scopedJobs,
-      resumeText: analysis.parsedText,
-      resumeProfile: analysis.profile,
-      topK: 30,
-      semanticTopK: 20,
-    }, onProgress);
-
     const token = await getAccessToken(supabaseClient);
-    onProgress?.({ message: 'Sending top jobs to the premium backend…', progress: 88 });
+    onProgress?.({ message: 'Sending parsed resume context to the premium web-search backend…', progress: 84 });
     const response = await fetch(PREMIUM_RUN_ENDPOINT, {
       method: 'POST',
       headers: {
@@ -327,7 +302,6 @@
           ...analysis.profile,
           resume_text: analysis.parsedText,
         },
-        candidateJobs: localPreRank.results,
       }),
     });
     const payload = await response.json().catch(() => ({}));
@@ -341,7 +315,7 @@
       filters,
     });
 
-    onProgress?.({ message: 'Premium results saved.', progress: 100 });
+    onProgress?.({ message: 'Premium web-search results saved.', progress: 100 });
     return payload;
   }
 
