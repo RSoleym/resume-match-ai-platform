@@ -115,34 +115,47 @@ async function searchLiveJobsWithOpenAI({ apiKey, searchModel, rerankModel, resu
   const merged = new Map();
   const sourceMap = new Map();
 
+  let lastSearchError = '';
+
   for (const attempt of attempts) {
     if (merged.size >= TARGET_RESULTS) break;
     for (const titles of titleBatches) {
       if (merged.size >= TARGET_RESULTS) break;
-      const { jobs, sources } = await callChatSearch({
-        apiKey,
-        model: searchModel,
-        resumeContext,
-        filters: attempt,
-        focusTitles: titles,
-        excludeUrls: Array.from(sourceMap.keys()),
-      });
-      addSources(sourceMap, sources);
-      addJobs(merged, jobs, attempt);
+      try {
+        const { jobs, sources } = await callChatSearch({
+          apiKey,
+          model: searchModel,
+          resumeContext,
+          filters: attempt,
+          focusTitles: titles,
+          excludeUrls: Array.from(sourceMap.keys()),
+        });
+        addSources(sourceMap, sources);
+        addJobs(merged, jobs, attempt);
+      } catch (error) {
+        lastSearchError = clean(error?.message || error, 600);
+      }
     }
   }
 
   if (!merged.size) {
-    const fallback = await callResponsesSearch({
-      apiKey,
-      model: rerankModel,
-      resumeContext,
-      filters: attempts[0],
-      focusTitles: titleBatches[0] || [],
-      excludeUrls: [],
-    });
-    addSources(sourceMap, fallback.sources);
-    addJobs(merged, fallback.jobs, attempts[0]);
+    for (const attempt of attempts) {
+      if (merged.size >= TARGET_RESULTS) break;
+      try {
+        const fallback = await callResponsesSearch({
+          apiKey,
+          model: rerankModel,
+          resumeContext,
+          filters: attempt,
+          focusTitles: titleBatches[0] || [],
+          excludeUrls: Array.from(sourceMap.keys()),
+        });
+        addSources(sourceMap, fallback.sources);
+        addJobs(merged, fallback.jobs, attempt);
+      } catch (error) {
+        lastSearchError = clean(error?.message || error, 600);
+      }
+    }
   }
 
   if (!merged.size && sourceMap.size) {
@@ -155,7 +168,7 @@ async function searchLiveJobsWithOpenAI({ apiKey, searchModel, rerankModel, resu
 
   const candidates = Array.from(merged.values()).slice(0, Math.max(TARGET_RESULTS, 18));
   if (!candidates.length) {
-    throw new Error('Premium live web search could not find usable job results.');
+    throw new Error(lastSearchError || 'Premium live web search could not find usable job results.');
   }
 
   const reranked = await rerankJobsWithOpenAI({
@@ -668,6 +681,22 @@ function buildChatUserLocation(countryName, city) {
   const country = countryCode(countryName);
   const locality = clean(city, 80);
   if (!country && !locality) return null;
+  const approximate = {};
+  if (country) approximate.country = country;
+  if (locality) {
+    approximate.city = locality;
+    approximate.region = locality;
+  }
+  return {
+    type: 'approximate',
+    approximate,
+  };
+}
+
+function buildResponsesUserLocation(countryName, city) {
+  const country = countryCode(countryName);
+  const locality = clean(city, 80);
+  if (!country && !locality) return null;
   const out = { type: 'approximate' };
   if (country) out.country = country;
   if (locality) {
@@ -677,18 +706,10 @@ function buildChatUserLocation(countryName, city) {
   return out;
 }
 
-function buildResponsesUserLocation(countryName, city) {
-  const country = countryCode(countryName);
-  const locality = clean(city, 80);
-  if (!country && !locality) return null;
-  const out = { type: 'approximate' };
-  if (country) out.country = country;
-  if (locality) out.city = locality;
-  return out;
-}
-
 function countryCode(countryName) {
-  const key = String(countryName || '').trim().toLowerCase();
+  const raw = String(countryName || '').trim();
+  if (/^[A-Za-z]{2}$/.test(raw)) return raw.toUpperCase();
+  const key = raw.toLowerCase();
   const map = {
     australia: 'AU',
     canada: 'CA',
