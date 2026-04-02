@@ -1,7 +1,8 @@
 const MAX_PREMIUM_SEARCHES = 3;
-const DEFAULT_RERANK_MODEL = 'gpt-4o-mini';
 const DEFAULT_SEARCH_MODEL = 'gpt-4o-search-preview';
-const TARGET_RESULTS = 12;
+const TARGET_RESULTS = 5;
+const MAX_SEARCH_CALLS = 2;
+const MAX_EXCLUDE_URLS = 8;
 
 const CATEGORY_ROLE_HINTS = {
   'Hardware / RTL / Verification': [
@@ -9,13 +10,11 @@ const CATEGORY_ROLE_HINTS = {
     'ASIC Verification Engineer',
     'RTL Design Engineer',
     'FPGA Engineer',
-    'Digital Design Engineer',
   ],
   'Embedded / Firmware': [
     'Embedded Firmware Engineer',
     'Firmware Engineer',
     'Embedded Software Engineer',
-    'Board Bring-Up Engineer',
   ],
   'Software Engineering': ['Software Engineer', 'Backend Engineer', 'C++ Software Engineer', 'Python Engineer'],
   'Data / AI / ML': ['Machine Learning Engineer', 'AI Engineer', 'Data Scientist'],
@@ -26,8 +25,7 @@ export async function onRequestPost(context) {
   const anonKey = readEnv(context.env, ['SUPABASE_ANON_KEY', 'SUPABASE_PUBLISHABLE_KEY']);
   const secretKey = readEnv(context.env, ['SUPABASE_SECRET_KEY', 'SUPABASE_SERVICE_ROLE_KEY', 'SUPABASE_SERVICE_KEY']);
   const openAiKey = readEnv(context.env, ['OPENAI_API_KEY', 'OPENAI_KEY']);
-  const rerankModel = readEnv(context.env, ['OPENAI_MODEL', 'OPENAI_DEFAULT_MODEL']) || DEFAULT_RERANK_MODEL;
-  const searchModel = readEnv(context.env, ['OPENAI_WEB_CHAT_MODEL', 'OPENAI_SEARCH_MODEL']) || DEFAULT_SEARCH_MODEL;
+  const searchModel = readEnv(context.env, ['OPENAI_WEB_CHAT_MODEL', 'OPENAI_SEARCH_MODEL', 'OPENAI_MODEL']) || DEFAULT_SEARCH_MODEL;
 
   const missing = [];
   if (!supabaseUrl) missing.push('SUPABASE_URL');
@@ -47,8 +45,8 @@ export async function onRequestPost(context) {
     const resumeId = clean(body?.resumeId, 120);
 
     if (!resumeId) return json({ error: 'Resume ID is required.' }, 400);
-    if (!clean(resumeContext?.resume_text, 120)) {
-      return json({ error: 'Parsed resume text is required for premium web search.' }, 400);
+    if (!hasMeaningfulResumeContext(resumeContext)) {
+      return json({ error: 'Parsed resume data is required for premium web search.' }, 400);
     }
 
     const profile = await getProfile({ supabaseUrl, secretKey, userId: user.id });
@@ -65,7 +63,6 @@ export async function onRequestPost(context) {
     const searchResult = await searchLiveJobsWithOpenAI({
       apiKey: openAiKey,
       searchModel,
-      rerankModel,
       resumeContext,
       filters,
     });
@@ -95,135 +92,108 @@ export async function onRequestPost(context) {
       sources: searchResult.sources,
     });
   } catch (error) {
-    return json({ error: error?.message || 'Unexpected premium backend error.' }, 500);
+    return json({ error: simplifyErrorMessage(error) }, 500);
   }
 }
 
-async function searchLiveJobsWithOpenAI({ apiKey, searchModel, rerankModel, resumeContext, filters }) {
+async function searchLiveJobsWithOpenAI({ apiKey, searchModel, resumeContext, filters }) {
   const requestedCountry = clean(filters?.country || resumeContext?.candidate_country || '', 80);
   const requestedRegion = clean(filters?.region || '', 80);
   const requestedWorkMode = clean(filters?.workMode || '', 40);
   const postedWindow = normalizePosted(filters?.posted || 'all');
 
+  const sourceMap = new Map();
+  const merged = new Map();
   const attempts = buildBroadeningPlan({
     country: requestedCountry,
     region: requestedRegion,
     workMode: requestedWorkMode,
     posted: postedWindow,
-  });
-  const titleBatches = makeFocusTitleBatches(resumeContext);
-  const merged = new Map();
-  const sourceMap = new Map();
+  }).slice(0, MAX_SEARCH_CALLS);
+  const focusTitles = makeFocusTitleBatches(resumeContext)[0] || [];
 
-  let lastSearchError = '';
-
+  let lastError = '';
   for (const attempt of attempts) {
-    if (merged.size >= TARGET_RESULTS) break;
-    for (const titles of titleBatches) {
+    try {
+      const { jobs, sources } = await callChatSearch({
+        apiKey,
+        model: searchModel,
+        resumeContext,
+        filters: attempt,
+        focusTitles,
+        excludeUrls: Array.from(sourceMap.keys()).slice(0, MAX_EXCLUDE_URLS),
+      });
+      addSources(sourceMap, sources);
+      addJobs(merged, jobs, attempt);
       if (merged.size >= TARGET_RESULTS) break;
-      try {
-        const { jobs, sources } = await callChatSearch({
-          apiKey,
-          model: searchModel,
-          resumeContext,
-          filters: attempt,
-          focusTitles: titles,
-          excludeUrls: Array.from(sourceMap.keys()),
-        });
-        addSources(sourceMap, sources);
-        addJobs(merged, jobs, attempt);
-      } catch (error) {
-        lastSearchError = clean(error?.message || error, 600);
-      }
+    } catch (error) {
+      lastError = clean(error?.message || error, 600);
     }
   }
 
   if (!merged.size) {
-    for (const attempt of attempts) {
-      if (merged.size >= TARGET_RESULTS) break;
-      try {
-        const fallback = await callResponsesSearch({
-          apiKey,
-          model: rerankModel,
-          resumeContext,
-          filters: attempt,
-          focusTitles: titleBatches[0] || [],
-          excludeUrls: Array.from(sourceMap.keys()),
-        });
-        addSources(sourceMap, fallback.sources);
-        addJobs(merged, fallback.jobs, attempt);
-      } catch (error) {
-        lastSearchError = clean(error?.message || error, 600);
-      }
+    try {
+      const fallback = await callResponsesSearch({
+        apiKey,
+        model: searchModel,
+        resumeContext,
+        filters: attempts[0] || { country: requestedCountry, region: requestedRegion, workMode: requestedWorkMode, posted: postedWindow },
+        focusTitles,
+        excludeUrls: Array.from(sourceMap.keys()).slice(0, MAX_EXCLUDE_URLS),
+      });
+      addSources(sourceMap, fallback.sources);
+      addJobs(merged, fallback.jobs, filters);
+    } catch (error) {
+      lastError = clean(error?.message || error, 600);
     }
   }
 
-  if (!merged.size && sourceMap.size) {
-    for (const source of sourceMap.values()) {
-      const row = normalizeSourceFallback(source, { country: requestedCountry, workMode: requestedWorkMode });
-      if (row?.best_url) merged.set(row.best_url, row);
-      if (merged.size >= TARGET_RESULTS) break;
-    }
+  if (!merged.size) {
+    throw new Error(lastError || 'Premium live web search could not find usable job results.');
   }
 
-  const candidates = Array.from(merged.values()).slice(0, Math.max(TARGET_RESULTS, 18));
-  if (!candidates.length) {
-    throw new Error(lastSearchError || 'Premium live web search could not find usable job results.');
-  }
-
-  const reranked = await rerankJobsWithOpenAI({
-    apiKey,
-    model: rerankModel,
-    resumeContext,
-    jobs: candidates,
-  });
+  const results = Array.from(merged.values())
+    .sort((a, b) => (b.final_match_percent || 0) - (a.final_match_percent || 0))
+    .slice(0, TARGET_RESULTS);
 
   return {
-    results: reranked.slice(0, TARGET_RESULTS),
+    results,
     sources: Array.from(sourceMap.values()).slice(0, TARGET_RESULTS),
   };
 }
 
 async function callChatSearch({ apiKey, model, resumeContext, filters, focusTitles, excludeUrls }) {
-  const prompt = buildSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, maxResults: 6 });
+  const prompt = buildCompactSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, maxResults: TARGET_RESULTS });
   const webSearchOptions = { search_context_size: 'low' };
   const userLocation = buildChatUserLocation(filters?.country, filters?.region);
   if (userLocation) webSearchOptions.user_location = userLocation;
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: [
-        {
-          role: 'developer',
-          content: 'Find direct live job detail pages only. Do not use any database jobs. Use the resume-derived roles and filters. Avoid generic listings. Return only JSON with a top-level jobs array.',
-        },
-        { role: 'user', content: prompt },
-      ],
-      web_search_options: webSearchOptions,
-      max_completion_tokens: 1800,
-      temperature: 0.2,
-    }),
+  const body = {
+    model,
+    messages: [
+      {
+        role: 'developer',
+        content: 'Find 5 current direct job-posting pages from the live web that fit the candidate. Do not use database jobs. Avoid search result pages. Return only JSON with a top-level jobs array.',
+      },
+      { role: 'user', content: prompt },
+    ],
+    web_search_options: webSearchOptions,
+    max_completion_tokens: 700,
+    temperature: 0.1,
+  };
+
+  const data = await fetchOpenAiJsonWithRetry({
+    url: 'https://api.openai.com/v1/chat/completions',
+    apiKey,
+    body,
   });
-
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || 'Premium web chat search failed.');
-  }
-
-  const data = await response.json().catch(() => ({}));
   const { text, sources } = extractChatTextAndSources(data);
   const jobs = normalizeSearchResults(extractJsonArray(text), filters, sources);
   return { jobs, sources };
 }
 
 async function callResponsesSearch({ apiKey, model, resumeContext, filters, focusTitles, excludeUrls }) {
-  const prompt = buildSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, maxResults: 8 });
+  const prompt = buildCompactSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, maxResults: TARGET_RESULTS });
   const tool = { type: 'web_search' };
   const userLocation = buildResponsesUserLocation(filters?.country, filters?.region);
   if (userLocation) tool.user_location = userLocation;
@@ -234,145 +204,78 @@ async function callResponsesSearch({ apiKey, model, resumeContext, filters, focu
     tool_choice: 'auto',
     include: ['web_search_call.action.sources'],
     input: prompt,
-    max_output_tokens: 2200,
+    max_output_tokens: 900,
     store: false,
   };
-  if (['gpt-5', 'o4-mini', 'o3'].includes(model)) {
-    body.reasoning = { effort: 'low' };
-  }
 
-  const response = await fetch('https://api.openai.com/v1/responses', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify(body),
+  const data = await fetchOpenAiJsonWithRetry({
+    url: 'https://api.openai.com/v1/responses',
+    apiKey,
+    body,
   });
 
-  if (!response.ok) {
-    const message = await response.text();
-    throw new Error(message || 'Premium responses web search failed.');
-  }
-
-  const data = await response.json().catch(() => ({}));
   const text = extractOutputText(data);
   const sources = extractSources(data);
   const jobs = normalizeSearchResults(extractJsonArray(text), filters, sources);
   return { jobs, sources };
 }
 
-async function rerankJobsWithOpenAI({ apiKey, model, resumeContext, jobs }) {
-  const payload = {
-    resume: {
-      country: clean(resumeContext.candidate_country, 80),
-      experience_years: resumeContext.candidate_experience_years ?? null,
-      degree_level: clean(resumeContext.candidate_degree_level, 60),
-      degree_family: clean(resumeContext.candidate_degree_family, 120),
-      degree_fields: Array.isArray(resumeContext.candidate_degree_fields) ? resumeContext.candidate_degree_fields.slice(0, 8) : [],
-      function: clean(resumeContext.candidate_function, 120),
-      domain: clean(resumeContext.candidate_domain, 120),
-      category: clean(resumeContext.candidate_category_key, 120),
-      resume_text_excerpt: clean(resumeContext.resume_text, 3000),
-    },
-    jobs: jobs.map((job) => ({
-      job_id: clean(job.job_id, 180),
-      title: clean(job.title, 180),
-      company: clean(job.company, 140),
-      location: clean(job.location, 160),
-      country: clean(job.country, 80),
-      work_mode: clean(job.work_mode, 40),
-      posted_date: clean(job.posted_date_display || job.posted_date, 60),
-      description_excerpt: clean(job.description_text, 1200),
-      discovered_via_live_web: true,
-    })),
-    rules: {
-      score_range: '0 to 100',
-      keep_all_job_ids: true,
-      return_json_only: true,
-      output_schema: {
-        results: [{ job_id: 'string', premium_score: 'number', premium_reason: 'short string <= 18 words' }],
+async function fetchOpenAiJsonWithRetry({ url, apiKey, body, attempts = 2 }) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
       },
-    },
-  };
+      body: JSON.stringify(body),
+    });
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model,
-      temperature: 0.2,
-      messages: [
-        {
-          role: 'system',
-          content: 'You are a strict resume-to-job reranker. Score every job for fit. Return only JSON.',
-        },
-        {
-          role: 'user',
-          content: JSON.stringify(payload),
-        },
-      ],
-      max_completion_tokens: 2200,
-    }),
-  });
+    if (response.ok) {
+      return response.json().catch(() => ({}));
+    }
 
-  if (!response.ok) {
     const message = await response.text();
-    throw new Error(message || 'Premium rerank failed.');
+    if (response.status === 429 && attempt < attempts) {
+      const waitMs = extractRetryDelayMs(message);
+      await sleep(waitMs);
+      lastError = new Error(message || 'Rate limit reached.');
+      continue;
+    }
+    throw new Error(message || 'OpenAI request failed.');
   }
-
-  const data = await response.json().catch(() => ({}));
-  const text = extractChatText(data);
-  const parsed = extractJsonObject(text);
-  const returned = Array.isArray(parsed?.results) ? parsed.results : [];
-  const byId = new Map(returned.map((item) => [clean(item?.job_id, 180), item]));
-
-  return jobs
-    .map((job) => {
-      const hit = byId.get(clean(job.job_id, 180)) || {};
-      const premiumScore = clamp(Number(hit?.premium_score ?? job.final_match_percent ?? 0), 0, 100);
-      return {
-        ...job,
-        raw_match_percent: Math.round(Number(job.final_match_percent || job.raw_match_percent || 0)),
-        final_match_percent: Math.round(premiumScore),
-        premium_reason: clean(hit?.premium_reason || job.premium_reason, 140),
-      };
-    })
-    .sort((a, b) => (b.final_match_percent || 0) - (a.final_match_percent || 0));
+  throw lastError || new Error('OpenAI request failed.');
 }
 
-function buildSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, maxResults }) {
+function buildCompactSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, maxResults }) {
   const profile = deriveResumeSearchProfile(resumeContext);
-  const requestedTitles = uniqueKeepOrder([...(focusTitles || []), ...(profile.role_titles || [])], 8);
-  const keywords = uniqueKeepOrder(profile.keywords || [], 16);
-  const negative = uniqueKeepOrder(profile.negative_terms || [], 10);
+  const requestedTitles = uniqueKeepOrder([...(focusTitles || []), ...(profile.role_titles || [])], 4);
+  const keywords = uniqueKeepOrder(profile.keywords || [], 10);
+  const negative = uniqueKeepOrder(profile.negative_terms || [], 6);
 
   return JSON.stringify({
     candidate: {
-      category: clean(resumeContext.candidate_category_key, 120),
-      function: clean(resumeContext.candidate_function, 120),
-      domain: clean(resumeContext.candidate_domain, 120),
+      category: clean(resumeContext.candidate_category_key, 80),
+      function: clean(resumeContext.candidate_function, 80),
+      domain: clean(resumeContext.candidate_domain, 80),
       target_titles: requestedTitles,
       skill_keywords: keywords,
-      negative_terms: negative,
-      resume_text_excerpt: clean(resumeContext.resume_text, 2500),
+      summary: clean(resumeContext.summary || resumeContext.experience || resumeContext.projects || resumeContext.resume_text, 700),
     },
     filters: {
-      country: clean(filters?.country, 80),
-      region: clean(filters?.region, 80),
-      work_mode: clean(filters?.workMode, 40),
-      posted_window: clean(filters?.posted, 60),
-      exclude_urls: Array.isArray(excludeUrls) ? excludeUrls.slice(0, 20) : [],
+      country: clean(filters?.country, 60),
+      region: clean(filters?.region, 60),
+      work_mode: clean(filters?.workMode, 24),
+      posted_window: clean(filters?.posted, 40),
+      exclude_urls: Array.isArray(excludeUrls) ? excludeUrls.slice(0, MAX_EXCLUDE_URLS) : [],
     },
     instructions: {
       live_web_only: true,
       no_database_jobs: true,
       direct_job_pages_only: true,
-      max_results: Math.max(4, Number(maxResults || 6)),
-      prefer_company_or_ats_pages: true,
+      max_results: Math.max(3, Number(maxResults || TARGET_RESULTS)),
+      avoid_terms: negative,
       return_shape: {
         jobs: [
           {
@@ -382,11 +285,10 @@ function buildSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, m
             country: 'string',
             work_mode: 'string',
             posted_date: 'string',
-            description_text: 'string',
+            description_text: 'short string',
             url: 'string',
-            job_function: 'string',
-            job_domain: 'string',
-            job_category_key: 'string',
+            match_percentage: 0,
+            reason: 'short string',
           },
         ],
       },
@@ -395,17 +297,26 @@ function buildSearchPrompt({ resumeContext, filters, focusTitles, excludeUrls, m
   });
 }
 
+function hasMeaningfulResumeContext(resumeContext) {
+  return !!(
+    clean(resumeContext?.resume_text, 80)
+    || clean(resumeContext?.summary, 80)
+    || clean(resumeContext?.skills, 80)
+    || clean(resumeContext?.experience, 80)
+    || clean(resumeContext?.candidate_function, 40)
+  );
+}
+
 function deriveResumeSearchProfile(resumeContext) {
   const category = clean(resumeContext?.candidate_category_key, 120);
   const functionName = clean(resumeContext?.candidate_function, 120);
   const domainName = clean(resumeContext?.candidate_domain, 120);
   const textBlob = [
-    clean(resumeContext?.summary, 1200),
-    clean(resumeContext?.skills, 1400),
-    clean(resumeContext?.experience, 1400),
-    clean(resumeContext?.projects, 1200),
-    clean(resumeContext?.education, 900),
-    clean(resumeContext?.resume_text, 2600),
+    clean(resumeContext?.summary, 800),
+    clean(resumeContext?.skills, 900),
+    clean(resumeContext?.experience, 900),
+    clean(resumeContext?.projects, 700),
+    clean(resumeContext?.resume_text, 1200),
   ].join(' ').toLowerCase();
 
   const roles = [];
@@ -419,7 +330,7 @@ function deriveResumeSearchProfile(resumeContext) {
 
   const keywords = [];
   for (const piece of String(resumeContext?.skills || '').split(/[,;|/\n]/)) {
-    const token = clean(piece, 60);
+    const token = clean(piece, 40);
     if (token) keywords.push(token);
   }
   for (const token of ['systemverilog', 'verilog', 'rtl', 'uvm', 'asic', 'fpga', 'embedded', 'firmware', 'python', 'c++', 'vivado']) {
@@ -428,33 +339,26 @@ function deriveResumeSearchProfile(resumeContext) {
 
   const negative = [];
   if (category === 'Hardware / RTL / Verification') {
-    negative.push('mechanical', 'civil', 'construction', 'power systems', 'controls engineer');
+    negative.push('mechanical', 'civil', 'construction', 'power systems');
   }
 
   return {
-    role_titles: uniqueKeepOrder(roles, 8),
-    keywords: uniqueKeepOrder(keywords, 16),
-    negative_terms: uniqueKeepOrder(negative, 10),
+    role_titles: uniqueKeepOrder(roles, 6),
+    keywords: uniqueKeepOrder(keywords, 10),
+    negative_terms: uniqueKeepOrder(negative, 6),
   };
 }
 
 function makeFocusTitleBatches(resumeContext) {
   const titles = deriveResumeSearchProfile(resumeContext).role_titles || [];
   if (!titles.length) return [['']];
-  const batches = [];
-  for (let i = 0; i < titles.length; i += 2) {
-    batches.push(titles.slice(i, i + 2));
-  }
-  if (titles[0]) batches.push([titles[0]]);
-  return batches.slice(0, 4);
+  return [titles.slice(0, 2)];
 }
 
 function buildBroadeningPlan({ country, region, workMode, posted }) {
   const plan = [
     { country, region, workMode, posted },
     { country, region: '', workMode, posted },
-    { country, region: '', workMode: '', posted },
-    { country, region: '', workMode: '', posted: 'any recent time' },
   ];
   const seen = new Set();
   return plan.filter((item) => {
@@ -478,6 +382,7 @@ function normalizeSearchResults(items, filters, sources) {
     const location = clean(item.location, 160);
     const country = clean(item.country, 80) || clean(filters?.country, 80);
     const workMode = normalizeWorkMode(item.work_mode || item.workMode || filters?.workMode || 'on-site');
+    const score = clamp(Number(item.match_percentage || item.premium_score || 0), 0, 100);
     rows.push({
       job_id: makeStableId(`${title}-${company}-${bestUrl}`),
       title,
@@ -488,45 +393,18 @@ function normalizeSearchResults(items, filters, sources) {
       work_mode: workMode,
       posted_date_display: clean(item.posted_date || item.posted_date_display, 60) || 'Recently posted',
       best_url: bestUrl,
-      description_text: clean(item.description_text || item.description || '', 1600),
+      description_text: clean(item.description_text || item.description || '', 600),
       job_function: clean(item.job_function, 120),
       job_domain: clean(item.job_domain, 120),
       job_category_key: clean(item.job_category_key || item.job_category, 120),
-      raw_match_percent: 0,
-      final_match_percent: 0,
-      premium_reason: '',
+      raw_match_percent: Math.round(score),
+      final_match_percent: Math.round(score),
+      premium_reason: clean(item.reason || item.premium_reason, 140),
       penalty_applied: false,
       penalty_points: 0,
     });
   }
   return dedupeJobs(rows);
-}
-
-function normalizeSourceFallback(source, filters) {
-  const url = clean(source?.url, 500);
-  const title = clean(source?.title, 180);
-  if (!url || !title) return null;
-  const company = clean(inferCompanyFromTitle(title), 140) || 'Unknown company';
-  return {
-    job_id: makeStableId(`${title}-${company}-${url}`),
-    title,
-    company,
-    location: '',
-    country: clean(filters?.country, 80),
-    region: '',
-    work_mode: normalizeWorkMode(filters?.workMode || 'on-site'),
-    posted_date_display: 'Recently posted',
-    best_url: url,
-    description_text: '',
-    job_function: '',
-    job_domain: '',
-    job_category_key: '',
-    raw_match_percent: 0,
-    final_match_percent: 0,
-    premium_reason: '',
-    penalty_applied: false,
-    penalty_points: 0,
-  };
 }
 
 function extractChatTextAndSources(data) {
@@ -561,7 +439,7 @@ function extractOutputText(data) {
   for (const item of output) {
     if (item?.type !== 'message' || !Array.isArray(item?.content)) continue;
     for (const block of item.content) {
-      if (block?.type === 'output_text' && typeof block?.text === 'string') {
+      if ((block?.type === 'output_text' || block?.type === 'text') && typeof block?.text === 'string') {
         parts.push(block.text);
       }
     }
@@ -634,7 +512,7 @@ function addJobs(targetMap, jobs, filters) {
       work_mode: normalizeWorkMode(job.work_mode || filters?.workMode || 'on-site'),
     };
     targetMap.set(url, row);
-    if (targetMap.size >= TARGET_RESULTS * 2) break;
+    if (targetMap.size >= TARGET_RESULTS) break;
   }
 }
 
@@ -845,6 +723,26 @@ async function patchProfile({ supabaseUrl, secretKey, userId, patch }) {
     const message = await response.text();
     throw new Error(message || 'Could not update premium usage count.');
   }
+}
+
+function extractRetryDelayMs(message) {
+  const text = String(message || '');
+  const match = text.match(/try again in\s+([\d.]+)s/i);
+  const seconds = match ? Number(match[1]) : 6;
+  if (!Number.isFinite(seconds) || seconds <= 0) return 6000;
+  return Math.min(Math.ceil(seconds * 1000) + 350, 10000);
+}
+
+function simplifyErrorMessage(error) {
+  const text = clean(error?.message || error, 1200);
+  if (/rate_limit_exceeded|Rate limit reached/i.test(text)) {
+    return 'Premium search hit the OpenAI rate limit. Wait about 10 seconds and run it again.';
+  }
+  return text || 'Unexpected premium backend error.';
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function json(payload, status = 200) {
